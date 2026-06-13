@@ -21,8 +21,13 @@ TOKEN      = os.environ["TELEGRAM_TOKEN"]
 ADMIN_ID   = int(os.environ.get("ADMIN_ID", "0"))
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 
+# реквизиты для оплаты публикации
+PAY_AMOUNT = "1000"
+PAY_PHONE  = "+7 702 261 62 15"
+PAY_NAME   = "Meiramkul"
+
 # шаги анкеты
-PHOTOS, TITLE, PRICE, CITY, SIZE, FRESH, PHONE = range(7)
+PHOTOS, TITLE, PRICE, CITY, SIZE, FRESH, PHONE, PAYMENT = range(8)
 
 MAX_PHOTOS = 5
 
@@ -64,7 +69,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "2️⃣ Можно добавить несколько фото (до 5)\n"
         "3️⃣ Заполни название, цену, город, размер, свежесть\n"
         "4️⃣ Оставь телефон\n"
-        "5️⃣ Жди проверки — и объявление в канале!\n\n"
+        f"5️⃣ Оплати публикацию ({PAY_AMOUNT}₸) и пришли чек\n"
+        "6️⃣ Жди проверки — и объявление в канале!\n\n"
         "Когда букет продан — нажми «✅ Продано» под своим объявлением.\n\n"
         "*/start* — начать\n*/cancel* — отменить",
         parse_mode="Markdown"
@@ -186,7 +192,7 @@ async def ad_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def ad_fresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["fresh"] = update.message.text.strip()[:120]
     await update.message.reply_text(
-        "📞 *Шаг 7 из 7*\n\nОставь *телефон* для связи:\n_Напр. +7 707 123 45 67_",
+        "📞 *Шаг 7 из 8*\n\nОставь *телефон* для связи:\n_Напр. +7 707 123 45 67_",
         parse_mode="Markdown")
     return PHONE
 
@@ -199,13 +205,47 @@ async def ad_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["seller_username"] = u.username or ""
 
     d = ctx.user_data
-    # предпросмотр (первое фото + текст)
+    # предпросмотр объявления
     await update.message.reply_photo(
         photo=d["photos"][0], caption=format_ad(d), parse_mode="Markdown")
+    # инструкция по оплате
     await update.message.reply_text(
-        f"👆 Так будет выглядеть объявление ({len(d['photos'])} фото).\n\nОтправляем на проверку?",
+        f"👆 Так будет выглядеть объявление ({len(d['photos'])} фото).\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        "💳 *Шаг 8 из 8 — Оплата публикации*\n\n"
+        f"Публикация объявления стоит *{PAY_AMOUNT} ₸*.\n\n"
+        "*Как оплатить:*\n"
+        f"1️⃣ Переведите *{PAY_AMOUNT} ₸* на Kaspi:\n"
+        f"📱 `{PAY_PHONE}`\n"
+        f"👤 Получатель: *{PAY_NAME}*\n\n"
+        "2️⃣ В Kaspi откройте чек перевода → нажмите *«Поделиться»* → "
+        "сохраните чек (PDF или картинку)\n\n"
+        "3️⃣ Пришлите этот *чек* сюда (файлом или фото) 👇\n\n"
+        "_Чек проверит модератор перед публикацией._",
+        parse_mode="Markdown")
+    return PAYMENT
+
+
+async def ad_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # принимаем чек: фото или документ (PDF)
+    msg = update.message
+    receipt = None
+    if msg.photo:
+        receipt = ("photo", msg.photo[-1].file_id)
+    elif msg.document:
+        receipt = ("doc", msg.document.file_id)
+    else:
+        await msg.reply_text(
+            "Пожалуйста, пришли *чек* об оплате — фото или файл (PDF) из Kaspi.\n"
+            "Или нажми /cancel чтобы отменить.", parse_mode="Markdown")
+        return PAYMENT
+
+    ctx.user_data["receipt_type"] = receipt[0]
+    ctx.user_data["receipt_id"] = receipt[1]
+    await msg.reply_text(
+        "✅ Чек получен!\n\nОтправляем объявление на проверку?",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Отправить", callback_data="send_mod")],
+            [InlineKeyboardButton("✅ Отправить на проверку", callback_data="send_mod")],
             [InlineKeyboardButton("❌ Отменить", callback_data="cancel_ad")],
         ]))
     return ConversationHandler.END
@@ -257,9 +297,19 @@ async def send_to_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("❌ Отклонить", callback_data="reject")],
         ]))
     pending[sent.message_id] = d
+    # отправляем чек об оплате отдельным сообщением админу
+    try:
+        if d.get("receipt_type") == "photo":
+            await ctx.bot.send_photo(chat_id=ADMIN_ID, photo=d["receipt_id"],
+                caption=f"💳 Чек об оплате (1000₸ на {PAY_PHONE})")
+        elif d.get("receipt_type") == "doc":
+            await ctx.bot.send_document(chat_id=ADMIN_ID, document=d["receipt_id"],
+                caption=f"💳 Чек об оплате (1000₸ на {PAY_PHONE})")
+    except Exception as e:
+        logger.error(f"receipt send err: {e}")
     await q.message.reply_text(
-        "✅ Объявление отправлено на проверку!\n"
-        "Как только модератор одобрит — оно появится в канале. 🌷")
+        "✅ Объявление и чек отправлены на проверку!\n"
+        "После подтверждения оплаты модератором объявление появится в канале. 🌷")
 
 
 async def cancel_ad_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -395,6 +445,7 @@ def main():
             SIZE:  [CallbackQueryHandler(ad_size, pattern="^size_")],
             FRESH: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_fresh)],
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_phone)],
+            PAYMENT: [MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, ad_payment)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
