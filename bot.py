@@ -1,11 +1,14 @@
 """
 Telegram-бот: доска объявлений цветов ReBloomKZ
-Анкета (фото с подписью, размер, свежесть, контакт) → модерация → канал → кнопка "Продано"
+С базой данных PostgreSQL — заявки и объявления сохраняются при перезапуске.
 """
 
 import os
+import json
 import logging
 from datetime import datetime
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 )
@@ -20,6 +23,7 @@ logger = logging.getLogger(__name__)
 TOKEN      = os.environ["TELEGRAM_TOKEN"]
 ADMIN_ID   = int(os.environ.get("ADMIN_ID", "0"))
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
+DB_URL     = os.environ.get("DATABASE_URL", "")
 
 # реквизиты для оплаты публикации
 PAY_AMOUNT = "1000"
@@ -28,15 +32,8 @@ PAY_NAME   = "Meiramkul"
 
 # шаги анкеты
 PHOTOS, TITLE, PRICE, CITY, SIZE, FRESH, PHONE, PAYMENT = range(8)
-
 MAX_PHOTOS = 5
 
-# заявки на модерации: admin_msg_id → данные (+ список message_id карточек у админа)
-pending = {}
-# опубликованные: channel_msg_id → {seller_id, ...} чтобы продавец мог отметить "Продано"
-published = {}
-
-# варианты размера
 SIZES = {
     "size_low":  "Низкий (до 30 см)",
     "size_mid":  "Средний (30–50 см)",
@@ -45,7 +42,109 @@ SIZES = {
 }
 
 
-# ── /start ────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+#                    БАЗА ДАННЫХ
+# ════════════════════════════════════════════════════════════
+def db_connect():
+    return psycopg2.connect(DB_URL, cursor_factory=RealDictCursor)
+
+def db_init():
+    """создаём таблицы при старте, если их нет"""
+    if not DB_URL:
+        logger.warning("⚠️ DATABASE_URL не задан — база не работает!")
+        return
+    try:
+        conn = db_connect()
+        cur = conn.cursor()
+        # заявки на модерации
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pending (
+                admin_msg_id BIGINT PRIMARY KEY,
+                data JSONB NOT NULL,
+                created TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        # опубликованные объявления (для кнопки "Продано")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS published (
+                channel_msg_id BIGINT PRIMARY KEY,
+                seller_id BIGINT NOT NULL,
+                chat_id BIGINT NOT NULL,
+                is_caption BOOLEAN NOT NULL,
+                sold BOOLEAN DEFAULT FALSE,
+                created TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("✅ База данных готова")
+    except Exception as e:
+        logger.error(f"db_init err: {e}")
+
+def db_save_pending(admin_msg_id, data):
+    try:
+        conn = db_connect(); cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO pending (admin_msg_id, data) VALUES (%s, %s) "
+            "ON CONFLICT (admin_msg_id) DO UPDATE SET data = EXCLUDED.data",
+            (admin_msg_id, json.dumps(data)))
+        conn.commit(); cur.close(); conn.close()
+    except Exception as e:
+        logger.error(f"save_pending err: {e}")
+
+def db_get_pending(admin_msg_id):
+    try:
+        conn = db_connect(); cur = conn.cursor()
+        cur.execute("SELECT data FROM pending WHERE admin_msg_id = %s", (admin_msg_id,))
+        row = cur.fetchone(); cur.close(); conn.close()
+        return row["data"] if row else None
+    except Exception as e:
+        logger.error(f"get_pending err: {e}")
+        return None
+
+def db_del_pending(admin_msg_id):
+    try:
+        conn = db_connect(); cur = conn.cursor()
+        cur.execute("DELETE FROM pending WHERE admin_msg_id = %s", (admin_msg_id,))
+        conn.commit(); cur.close(); conn.close()
+    except Exception as e:
+        logger.error(f"del_pending err: {e}")
+
+def db_save_published(channel_msg_id, seller_id, chat_id, is_caption):
+    try:
+        conn = db_connect(); cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO published (channel_msg_id, seller_id, chat_id, is_caption) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (channel_msg_id) DO NOTHING",
+            (channel_msg_id, seller_id, chat_id, is_caption))
+        conn.commit(); cur.close(); conn.close()
+    except Exception as e:
+        logger.error(f"save_published err: {e}")
+
+def db_get_published(channel_msg_id):
+    try:
+        conn = db_connect(); cur = conn.cursor()
+        cur.execute("SELECT * FROM published WHERE channel_msg_id = %s AND sold = FALSE",
+                    (channel_msg_id,))
+        row = cur.fetchone(); cur.close(); conn.close()
+        return row
+    except Exception as e:
+        logger.error(f"get_published err: {e}")
+        return None
+
+def db_mark_sold(channel_msg_id):
+    try:
+        conn = db_connect(); cur = conn.cursor()
+        cur.execute("UPDATE published SET sold = TRUE WHERE channel_msg_id = %s", (channel_msg_id,))
+        conn.commit(); cur.close(); conn.close()
+    except Exception as e:
+        logger.error(f"mark_sold err: {e}")
+
+
+# ════════════════════════════════════════════════════════════
+#                    КОМАНДЫ
+# ════════════════════════════════════════════════════════════
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "друг"
     kb = InlineKeyboardMarkup([
@@ -58,8 +157,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Подай объявление — после проверки оно появится в нашем канале, "
         "где его увидят покупатели.\n\n"
         "Нажми кнопку, чтобы начать:",
-        reply_markup=kb, parse_mode="Markdown"
-    )
+        reply_markup=kb, parse_mode="Markdown")
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -73,8 +171,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "6️⃣ Жди проверки — и объявление в канале!\n\n"
         "Когда букет продан — нажми «✅ Продано» под своим объявлением.\n\n"
         "*/start* — начать\n*/cancel* — отменить",
-        parse_mode="Markdown"
-    )
+        parse_mode="Markdown")
 
 
 async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -84,29 +181,36 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(
             "🌷 Как всё устроено:\n\n"
             "• Ты фотографируешь букет с подписью на бумаге «ReBloomKZ» и датой "
-            "(это защита от обмана — подтверждает, что букет реальный и у тебя на руках)\n"
+            "(защита от обмана — подтверждает, что букет реальный и у тебя на руках)\n"
             "• Заполняешь анкету\n"
+            f"• Оплачиваешь публикацию ({PAY_AMOUNT}₸) и присылаешь чек\n"
             "• Мы проверяем\n"
             "• Объявление публикуется в канале с твоим контактом\n"
             "• Покупатели пишут тебе напрямую\n"
             "• Продал — нажал «Продано», и объявление помечается\n\n"
-            "Нажми /start чтобы начать!"
-        )
+            "Нажми /start чтобы начать!")
 
 
-# ── НАЧАЛО АНКЕТЫ ─────────────────────────────────────────────
+async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🆔 Твой Telegram ID: `{update.effective_user.id}`", parse_mode="Markdown")
+
+
+# ════════════════════════════════════════════════════════════
+#                    АНКЕТА
+# ════════════════════════════════════════════════════════════
 async def ad_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
     ctx.user_data["photos"] = []
     today = datetime.now().strftime("%d.%m.%Y")
     text = (
-        "📷 *Шаг 1 из 7 — Фото*\n\n"
+        "📷 *Шаг 1 из 8 — Фото*\n\n"
         "⚠️ *Важно для защиты от обмана:*\n"
         "Положи рядом с букетом листок с надписью *«ReBloomKZ»* и сегодняшней датой "
         f"(_{today}_), и сфотографируй букет вместе с этой подписью.\n\n"
         "Так покупатели будут уверены, что букет настоящий и у тебя на руках.\n\n"
         "📸 Отправь фото (можно несколько, до 5).\n"
-        "Когда закончишь — нажми кнопку «Готово»."
+        "Когда закончишь — нажми «Готово с фото»."
     )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Готово с фото", callback_data="photos_done")]])
     if update.callback_query:
@@ -124,7 +228,7 @@ async def ad_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return PHOTOS
     photos = ctx.user_data.setdefault("photos", [])
     if len(photos) >= MAX_PHOTOS:
-        await update.message.reply_text(f"Уже {MAX_PHOTOS} фото — достаточно. Нажми «Готово с фото».")
+        await update.message.reply_text(f"Уже {MAX_PHOTOS} фото. Нажми «Готово с фото».")
         return PHOTOS
     photos.append(update.message.photo[-1].file_id)
     left = MAX_PHOTOS - len(photos)
@@ -143,7 +247,7 @@ async def photos_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("Сначала отправь хотя бы одно фото 📷")
         return PHOTOS
     await q.message.reply_text(
-        "🌸 *Шаг 2 из 7*\n\nНапиши *название* (что продаёшь):\n_Напр. Букет из 25 роз_",
+        "🌸 *Шаг 2 из 8*\n\nНапиши *название* (что продаёшь):\n_Напр. Букет из 25 роз_",
         parse_mode="Markdown")
     return TITLE
 
@@ -151,14 +255,14 @@ async def photos_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def ad_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["title"] = update.message.text.strip()[:80]
     await update.message.reply_text(
-        "💰 *Шаг 3 из 7*\n\nУкажи *цену* в тенге:\n_Напр. 8000_", parse_mode="Markdown")
+        "💰 *Шаг 3 из 8*\n\nУкажи *цену* в тенге:\n_Напр. 8000_", parse_mode="Markdown")
     return PRICE
 
 
 async def ad_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["price"] = update.message.text.strip()[:20]
     await update.message.reply_text(
-        "📍 *Шаг 4 из 7*\n\nВ каком *городе*?\n_Напр. Алматы_", parse_mode="Markdown")
+        "📍 *Шаг 4 из 8*\n\nВ каком *городе*?\n_Напр. Алматы_", parse_mode="Markdown")
     return CITY
 
 
@@ -171,7 +275,7 @@ async def ad_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Экстра · более 80 см", callback_data="size_xl")],
     ])
     await update.message.reply_text(
-        "📏 *Шаг 5 из 7 — Размер*\n\nВыбери высоту букета:",
+        "📏 *Шаг 5 из 8 — Размер*\n\nВыбери высоту букета:",
         parse_mode="Markdown", reply_markup=kb)
     return SIZE
 
@@ -183,7 +287,7 @@ async def ad_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(f"📏 Размер: {ctx.user_data['size']} ✅")
     await ctx.bot.send_message(
         q.message.chat_id,
-        "🌿 *Шаг 6 из 7 — Свежесть*\n\nНасколько свежий букет?\n"
+        "🌿 *Шаг 6 из 8 — Свежесть*\n\nНасколько свежий букет?\n"
         "_Напр. собран сегодня, подарили вчера, стоит 2 дня_",
         parse_mode="Markdown")
     return FRESH
@@ -203,12 +307,9 @@ async def ad_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["seller_id"] = u.id
     ctx.user_data["seller_name"] = u.first_name or "Продавец"
     ctx.user_data["seller_username"] = u.username or ""
-
     d = ctx.user_data
-    # предпросмотр объявления
     await update.message.reply_photo(
         photo=d["photos"][0], caption=format_ad(d), parse_mode="Markdown")
-    # инструкция по оплате
     await update.message.reply_text(
         f"👆 Так будет выглядеть объявление ({len(d['photos'])} фото).\n\n"
         "━━━━━━━━━━━━━━━\n"
@@ -227,7 +328,6 @@ async def ad_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def ad_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # принимаем чек: фото или документ (PDF)
     msg = update.message
     receipt = None
     if msg.photo:
@@ -239,7 +339,6 @@ async def ad_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Пожалуйста, пришли *чек* об оплате — фото или файл (PDF) из Kaspi.\n"
             "Или нажми /cancel чтобы отменить.", parse_mode="Markdown")
         return PAYMENT
-
     ctx.user_data["receipt_type"] = receipt[0]
     ctx.user_data["receipt_id"] = receipt[1]
     await msg.reply_text(
@@ -251,7 +350,6 @@ async def ad_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ── формат карточки ──────────────────────────────────────────
 def format_ad(d):
     price = d.get("price", "")
     try:
@@ -271,7 +369,6 @@ def format_ad(d):
     return txt
 
 
-# ── отправка на модерацию ────────────────────────────────────
 async def send_to_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -279,16 +376,12 @@ async def send_to_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ADMIN_ID:
         await q.message.reply_text("⚠️ Модератор не настроен.")
         return
-
-    # отправляем альбом фото админу (если несколько)
     photos = d["photos"]
     if len(photos) > 1:
-        media = [InputMediaPhoto(p) for p in photos]
         try:
-            await ctx.bot.send_media_group(chat_id=ADMIN_ID, media=media)
+            await ctx.bot.send_media_group(chat_id=ADMIN_ID, media=[InputMediaPhoto(p) for p in photos])
         except Exception as e:
             logger.error(f"media_group err: {e}")
-
     caption = "🆕 *НА ПРОВЕРКУ*\n\n" + format_ad(d)
     sent = await ctx.bot.send_photo(
         chat_id=ADMIN_ID, photo=photos[0], caption=caption, parse_mode="Markdown",
@@ -296,20 +389,21 @@ async def send_to_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✅ Одобрить", callback_data="approve"),
              InlineKeyboardButton("❌ Отклонить", callback_data="reject")],
         ]))
-    pending[sent.message_id] = d
-    # отправляем чек об оплате отдельным сообщением админу
+    # сохраняем заявку в БАЗУ (а не в память!)
+    db_save_pending(sent.message_id, d)
+    # чек об оплате
     try:
         if d.get("receipt_type") == "photo":
             await ctx.bot.send_photo(chat_id=ADMIN_ID, photo=d["receipt_id"],
-                caption=f"💳 Чек об оплате (1000₸ на {PAY_PHONE})")
+                caption=f"💳 Чек об оплате ({PAY_AMOUNT}₸ на {PAY_PHONE})")
         elif d.get("receipt_type") == "doc":
             await ctx.bot.send_document(chat_id=ADMIN_ID, document=d["receipt_id"],
-                caption=f"💳 Чек об оплате (1000₸ на {PAY_PHONE})")
+                caption=f"💳 Чек об оплате ({PAY_AMOUNT}₸ на {PAY_PHONE})")
     except Exception as e:
-        logger.error(f"receipt send err: {e}")
+        logger.error(f"receipt err: {e}")
     await q.message.reply_text(
         "✅ Объявление и чек отправлены на проверку!\n"
-        "После подтверждения оплаты модератором объявление появится в канале. 🌷")
+        "После подтверждения оплаты объявление появится в канале. 🌷")
 
 
 async def cancel_ad_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -325,14 +419,17 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ── РЕШЕНИЕ МОДЕРАТОРА ────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+#                    МОДЕРАЦИЯ
+# ════════════════════════════════════════════════════════════
 async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     msg_id = q.message.message_id
-    d = pending.get(msg_id)
+    d = db_get_pending(msg_id)        # читаем из БАЗЫ
     if not d:
-        await q.edit_message_caption(caption=(q.message.caption or "") + "\n\n⚠️ Данные устарели.", parse_mode="Markdown")
+        await q.edit_message_caption(
+            caption=(q.message.caption or "") + "\n\n⚠️ Данные устарели.", parse_mode="Markdown")
         return
 
     if q.data == "approve":
@@ -341,24 +438,21 @@ async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         try:
             photos = d["photos"]
-            # если несколько фото — публикуем альбом, текст отдельным сообщением с кнопками
             if len(photos) > 1:
-                media = [InputMediaPhoto(p) for p in photos]
-                await ctx.bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+                await ctx.bot.send_media_group(chat_id=CHANNEL_ID, media=[InputMediaPhoto(p) for p in photos])
                 sent = await ctx.bot.send_message(
                     chat_id=CHANNEL_ID, text=format_ad(d), parse_mode="Markdown",
                     reply_markup=channel_buttons(d))
+                is_caption = False
             else:
                 sent = await ctx.bot.send_photo(
                     chat_id=CHANNEL_ID, photo=photos[0], caption=format_ad(d),
                     parse_mode="Markdown", reply_markup=channel_buttons(d))
-
-            published[sent.message_id] = {
-                "seller_id": d["seller_id"],
-                "chat_id": sent.chat_id,
-                "is_caption": len(photos) == 1,
-            }
-            await q.edit_message_caption(caption=(q.message.caption or "") + "\n\n✅ *ОПУБЛИКОВАНО*", parse_mode="Markdown")
+                is_caption = True
+            # сохраняем опубликованное в БАЗУ
+            db_save_published(sent.message_id, d["seller_id"], sent.chat_id, is_caption)
+            await q.edit_message_caption(
+                caption=(q.message.caption or "") + "\n\n✅ *ОПУБЛИКОВАНО*", parse_mode="Markdown")
             try:
                 await ctx.bot.send_message(d["seller_id"],
                     "🎉 Твоё объявление одобрено и опубликовано в канале!\n"
@@ -368,21 +462,20 @@ async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"publish err: {e}")
             await q.message.reply_text(f"❌ Ошибка публикации: {e}")
-
     elif q.data == "reject":
-        await q.edit_message_caption(caption=(q.message.caption or "") + "\n\n❌ *ОТКЛОНЕНО*", parse_mode="Markdown")
+        await q.edit_message_caption(
+            caption=(q.message.caption or "") + "\n\n❌ *ОТКЛОНЕНО*", parse_mode="Markdown")
         try:
             await ctx.bot.send_message(d["seller_id"],
                 "К сожалению, объявление не прошло проверку. 😔\n"
-                "Возможно, нет подписи «ReBloomKZ» на фото или не хватает данных. "
+                "Возможно, нет подписи «ReBloomKZ» на фото, не хватает данных или оплаты. "
                 "Попробуй снова через /start")
         except:
             pass
-    pending.pop(msg_id, None)
+    db_del_pending(msg_id)
 
 
 def channel_buttons(d, sold=False):
-    """кнопки под объявлением в канале"""
     if sold:
         return None
     rows = []
@@ -394,42 +487,37 @@ def channel_buttons(d, sold=False):
         row.append(InlineKeyboardButton("✈️ Написать", url=f"https://t.me/{d['seller_username']}"))
     if row:
         rows.append(row)
-    # кнопка "Продано" — нажимает продавец
     rows.append([InlineKeyboardButton("✅ Продано (для продавца)", callback_data="mark_sold")])
     return InlineKeyboardMarkup(rows)
 
 
-# ── КНОПКА "ПРОДАНО" ──────────────────────────────────────────
 async def on_mark_sold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    info = published.get(q.message.message_id)
+    info = db_get_published(q.message.message_id)   # читаем из БАЗЫ
     if not info:
-        await q.answer("Не удалось найти объявление.", show_alert=True)
+        await q.answer("Объявление не найдено или уже продано.", show_alert=True)
         return
-    # отметить может только продавец или админ
     if q.from_user.id != info["seller_id"] and q.from_user.id != ADMIN_ID:
         await q.answer("Только продавец может отметить «Продано».", show_alert=True)
         return
     await q.answer("Отмечено как продано ✅")
     try:
         if info["is_caption"]:
-            new_cap = "❌ *ПРОДАНО*\n\n" + (q.message.caption or "")
-            await q.edit_message_caption(caption=new_cap, parse_mode="Markdown", reply_markup=None)
+            await q.edit_message_caption(
+                caption="❌ *ПРОДАНО*\n\n" + (q.message.caption or ""),
+                parse_mode="Markdown", reply_markup=None)
         else:
-            new_txt = "❌ *ПРОДАНО*\n\n" + (q.message.text or "")
-            await q.edit_message_text(text=new_txt, parse_mode="Markdown", reply_markup=None)
+            await q.edit_message_text(
+                text="❌ *ПРОДАНО*\n\n" + (q.message.text or ""),
+                parse_mode="Markdown", reply_markup=None)
     except Exception as e:
         logger.error(f"mark sold err: {e}")
-    published.pop(q.message.message_id, None)
+    db_mark_sold(q.message.message_id)
 
 
-async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"🆔 Твой Telegram ID: `{update.effective_user.id}`", parse_mode="Markdown")
-
-
-# ── запуск ────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
 def main():
+    db_init()   # создаём таблицы при старте
     app = Application.builder().token(TOKEN).build()
 
     conv = ConversationHandler(
