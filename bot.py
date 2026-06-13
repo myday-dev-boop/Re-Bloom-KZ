@@ -126,15 +126,15 @@ async def ad_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def ad_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["city"] = update.message.text.strip()[:40]
     await update.message.reply_text(
-        "📝 Шаг 5 из 6\n\nДобавь *описание* (состав, доставка и т.д.):\n"
-        "_Или напиши «-» чтобы пропустить_",
+        "🗓 Шаг 5 из 6\n\nКогда *собран / подарен* букет?\n"
+        "_Напр. собран сегодня, подарили вчера_",
         parse_mode="Markdown")
     return DESC
 
 
 async def ad_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    desc = update.message.text.strip()
-    ctx.user_data["desc"] = "" if desc == "-" else desc[:500]
+    fresh = update.message.text.strip()
+    ctx.user_data["fresh"] = "" if fresh == "-" else fresh[:120]
     await update.message.reply_text(
         "📞 Шаг 6 из 6\n\nОставь *телефон* для связи:\n_Напр. +7 707 123 45 67_",
         parse_mode="Markdown")
@@ -175,8 +175,8 @@ def format_ad(d, preview=False):
     txt = f"🌸 *{d['title']}*\n\n"
     txt += f"💰 Цена: *{price} ₸*\n"
     txt += f"📍 Город: {d['city']}\n"
-    if d.get("desc"):
-        txt += f"\n{d['desc']}\n"
+    if d.get("fresh"):
+        txt += f"🗓 Собран/подарен: {d['fresh']}\n"
     txt += f"\n📞 Связь: {d['phone']}"
     uname = d.get("seller_username")
     if uname:
