@@ -38,13 +38,32 @@ PAY_NAME   = "Meiramkul"
 PHOTOS, CARD, WAIT_VAL, PAYMENT = range(4)
 MAX_PHOTOS = 5
 
-# справочник размеров: код кнопки -> текст
+# справочник размеров: код кнопки -> текст (как на скрине)
 SIZES = {
-    "size_low":  "Низкий (до 30 см)",
-    "size_mid":  "Средний (30–50 см)",
-    "size_high": "Высокий (50–80 см)",
-    "size_xl":   "Экстра-высокий (более 80 см)",
+    "size_huge":  "Огромный",
+    "size_big":   "Большой",
+    "size_mid":   "Средний",
+    "size_small": "Маленький",
+    "size_vol":   "Объёмный",
 }
+
+# состояние/свежесть букета: код кнопки -> текст (как на скрине)
+CONDITIONS = {
+    "fr_fresh":   "Свежайшие",
+    "fr_good":    "Хорошее состояние",
+    "fr_losing":  "Теряет свежесть",
+    "fr_wilting": "Заметно вянут",
+    "fr_slight":  "Немного увядшие",
+    "fr_wilted":  "Увядшие",
+}
+
+# города Казахстана (областные центры и крупные города)
+CITIES = [
+    "Алматы", "Астана", "Шымкент", "Караганда", "Актобе", "Тараз",
+    "Павлодар", "Усть-Каменогорск", "Семей", "Костанай", "Кызылорда",
+    "Уральск", "Петропавловск", "Актау", "Атырау", "Талдыкорган",
+    "Кокшетау", "Туркестан", "Темиртау", "Экибастуз", "Рудный",
+]
 
 # какие поля карточки обязательны для перехода к оплате
 REQUIRED_FIELDS = ["title", "price", "city", "size", "fresh", "phone"]
@@ -270,39 +289,42 @@ def card_text(d: dict) -> str:
     """Текст-подпись под фото в карточке-конструкторе."""
     def v(key, default):
         return d.get(key) or default
+    price = d.get("price")
+    price_line = f"{price} ₸" if price else "—"
     return (
-        "📝 *Заполнение объявления*\n\n"
-        f"Название: {v('title', '— не указано')}\n"
-        f"Цена: {v('price', '— не указана')}"
-        + (" ₸" if d.get('price') else "") + "\n"
-        f"Город: {v('city', '— не указан')}\n"
-        f"Размер: {v('size', '— не указан')}\n"
-        f"Свежесть: {v('fresh', '— не указана')}\n"
-        f"Телефон: {v('phone', '— не указан')}\n\n"
-        "Нажимай на кнопки и заполняй поля 👇"
+        "*Объявление*\n"
+        "─────────────\n"
+        f"*Название:*  {v('title', '—')}\n"
+        f"*Цена:*  {price_line}\n"
+        f"*Город:*  {v('city', '—')}\n"
+        f"*Размер:*  {v('size', '—')}\n"
+        f"*Свежесть:*  {v('fresh', '—')}\n"
+        f"*Телефон:*  {v('phone', '—')}\n"
+        "─────────────\n"
+        "_Нажмите на поле ниже, чтобы заполнить его._"
     )
 
 
 def card_keyboard(d: dict) -> InlineKeyboardMarkup:
     """Сетка кнопок карточки. ✓ помечает заполненные поля."""
     def mark(key, label):
-        return f"✓ {label}" if d.get(key) else label
+        return f"✓  {label}" if d.get(key) else label
 
     ready = all(d.get(f) for f in REQUIRED_FIELDS)
     bottom = (
-        InlineKeyboardButton("✅ Готово, к оплате", callback_data="card_done")
+        InlineKeyboardButton("Опубликовать  ›", callback_data="card_done")
         if ready else
-        InlineKeyboardButton("⚠️ Заполните данные", callback_data="card_noop")
+        InlineKeyboardButton("Заполните данные", callback_data="card_noop")
     )
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(mark("title", "🌸 Название"), callback_data="f:title"),
-         InlineKeyboardButton(mark("price", "💰 Цена"),    callback_data="f:price")],
-        [InlineKeyboardButton(mark("city", "📍 Город"),    callback_data="f:city"),
-         InlineKeyboardButton(mark("size", "📏 Размер"),   callback_data="f:size")],
-        [InlineKeyboardButton(mark("fresh", "🌿 Свежесть"), callback_data="f:fresh"),
-         InlineKeyboardButton(mark("phone", "📞 Телефон"),  callback_data="f:phone")],
-        [InlineKeyboardButton("📷 Изменить фото", callback_data="f:photos")],
-        [InlineKeyboardButton("❌ Отменить", callback_data="cancel_ad"), bottom],
+        [InlineKeyboardButton(mark("title", "Название"), callback_data="f:title"),
+         InlineKeyboardButton(mark("price", "Цена"),    callback_data="f:price")],
+        [InlineKeyboardButton(mark("city", "Город"),    callback_data="f:city"),
+         InlineKeyboardButton(mark("size", "Размер"),   callback_data="f:size")],
+        [InlineKeyboardButton(mark("fresh", "Свежесть"), callback_data="f:fresh"),
+         InlineKeyboardButton(mark("phone", "Телефон"),  callback_data="f:phone")],
+        [InlineKeyboardButton("Изменить фото", callback_data="f:photos")],
+        [InlineKeyboardButton("Отменить", callback_data="cancel_ad"), bottom],
     ])
 
 
@@ -350,27 +372,47 @@ async def card_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # вернуться к добавлению фото заново
         ctx.user_data["photos"] = []
         await q.message.reply_text(
-            "📷 Пришли новое фото (можно до 5). Когда закончишь — нажми «Готово с фото».",
+            "Пришлите новое фото (можно до 5). Когда закончите — нажмите «Готово с фото».",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("✅ Готово с фото", callback_data="photos_done")]]))
+                [[InlineKeyboardButton("Готово с фото", callback_data="photos_done")]]))
         return PHOTOS
 
+    # ── РАЗМЕР — список кнопок ──
     if field == "size":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Низкий · до 30 см", callback_data="size_low")],
-            [InlineKeyboardButton("Средний · 30–50 см", callback_data="size_mid")],
-            [InlineKeyboardButton("Высокий · 50–80 см", callback_data="size_high")],
-            [InlineKeyboardButton("Экстра · более 80 см", callback_data="size_xl")],
-        ])
-        await q.message.reply_text("📏 Выбери высоту букета:", reply_markup=kb)
+        rows = [[InlineKeyboardButton(text, callback_data=code)]
+                for code, text in SIZES.items()]
+        rows.append([InlineKeyboardButton("↩  Назад", callback_data="back_card")])
+        await q.message.reply_text("Выберите размер",
+                                   reply_markup=InlineKeyboardMarkup(rows))
         return WAIT_VAL
 
+    # ── СВЕЖЕСТЬ/СОСТОЯНИЕ — список кнопок ──
+    if field == "fresh":
+        rows = [[InlineKeyboardButton(text, callback_data=code)]
+                for code, text in CONDITIONS.items()]
+        rows.append([InlineKeyboardButton("↩  Назад", callback_data="back_card")])
+        await q.message.reply_text("Выберите состояние",
+                                   reply_markup=InlineKeyboardMarkup(rows))
+        return WAIT_VAL
+
+    # ── ГОРОД — список кнопок (по 2 в ряд, чтобы влезло) ──
+    if field == "city":
+        rows = []
+        for i in range(0, len(CITIES), 2):
+            row = [InlineKeyboardButton(CITIES[i], callback_data=f"city:{i}")]
+            if i + 1 < len(CITIES):
+                row.append(InlineKeyboardButton(CITIES[i + 1], callback_data=f"city:{i+1}"))
+            rows.append(row)
+        rows.append([InlineKeyboardButton("↩  Назад", callback_data="back_card")])
+        await q.message.reply_text("Выберите город",
+                                   reply_markup=InlineKeyboardMarkup(rows))
+        return WAIT_VAL
+
+    # ── остальные поля — ввод текстом ──
     prompts = {
-        "title": "🌸 Напиши *название* (что продаёшь):\n_Напр. Букет из 25 роз_",
-        "price": "💰 Укажи *цену* в тенге:\n_Напр. 8000_",
-        "city":  "📍 В каком *городе*?\n_Напр. Алматы_",
-        "fresh": "🌿 Насколько *свежий* букет?\n_Напр. собран сегодня, стоит 2 дня_",
-        "phone": "📞 Оставь *телефон* для связи:\n_Напр. +7 707 123 45 67_",
+        "title": "Напишите *название* — что продаёте:\n_Например: Букет из 25 роз_",
+        "price": "Укажите *цену* в тенге:\n_Например: 8000_",
+        "phone": "Оставьте *телефон* для связи:\n_Например: +7 707 123 45 67_",
     }
     await q.message.reply_text(prompts[field], parse_mode="Markdown")
     return WAIT_VAL
@@ -382,18 +424,58 @@ async def card_set_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     ctx.user_data["size"] = SIZES.get(q.data, "")
     try:
-        await q.message.delete()  # убираем сообщение со списком размеров
+        await q.message.delete()
     except Exception:
         pass
     await send_card(q.message.chat_id, ctx)
     return CARD
 
 
-# получен текстовый ввод значения поля
+# выбрана свежесть/состояние (кнопкой)
+async def card_set_fresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data["fresh"] = CONDITIONS.get(q.data, "")
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    await send_card(q.message.chat_id, ctx)
+    return CARD
+
+
+# выбран город (кнопкой)
+async def card_set_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    idx = int(q.data.split(":", 1)[1])
+    if 0 <= idx < len(CITIES):
+        ctx.user_data["city"] = CITIES[idx]
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    await send_card(q.message.chat_id, ctx)
+    return CARD
+
+
+# нажато «↩️ Назад» в любом списке выбора — просто закрыть список, вернуть карточку
+async def card_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    await send_card(q.message.chat_id, ctx)
+    return CARD
+
+
+# получен текстовый ввод значения поля (название / цена / телефон)
 async def card_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     field = ctx.user_data.get("editing_field")
     text = update.message.text.strip()
-    limits = {"title": 80, "price": 20, "city": 40, "fresh": 120, "phone": 30}
+    limits = {"title": 80, "price": 20, "phone": 30}
     if field in limits:
         ctx.user_data[field] = text[:limits[field]]
     # удаляем сообщение пользователя, чтобы чат оставался чистым
@@ -646,6 +728,9 @@ def main():
             ],
             WAIT_VAL: [
                 CallbackQueryHandler(card_set_size, pattern="^size_"),
+                CallbackQueryHandler(card_set_fresh, pattern="^fr_"),
+                CallbackQueryHandler(card_set_city, pattern="^city:"),
+                CallbackQueryHandler(card_back, pattern="^back_card$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, card_value),
             ],
             PAYMENT: [MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, ad_payment)],
