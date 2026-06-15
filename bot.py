@@ -30,16 +30,24 @@ PAY_AMOUNT = "1000"
 PAY_PHONE  = "+7 702 261 62 15"
 PAY_NAME   = "Meiramkul"
 
-# шаги анкеты
-PHOTOS, TITLE, PRICE, CITY, SIZE, FRESH, PHONE, PAYMENT = range(8)
+# состояния диалога:
+#   PHOTOS   — приём фотографий
+#   CARD     — открыта карточка-конструктор (продавец жмёт кнопки полей)
+#   WAIT_VAL — ждём текстовый ввод значения выбранного поля
+#   PAYMENT  — приём чека об оплате
+PHOTOS, CARD, WAIT_VAL, PAYMENT = range(4)
 MAX_PHOTOS = 5
 
+# справочник размеров: код кнопки -> текст
 SIZES = {
     "size_low":  "Низкий (до 30 см)",
     "size_mid":  "Средний (30–50 см)",
     "size_high": "Высокий (50–80 см)",
     "size_xl":   "Экстра-высокий (более 80 см)",
 }
+
+# какие поля карточки обязательны для перехода к оплате
+REQUIRED_FIELDS = ["title", "price", "city", "size", "fresh", "phone"]
 
 
 # ════════════════════════════════════════════════════════════
@@ -204,7 +212,7 @@ async def ad_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["photos"] = []
     today = datetime.now().strftime("%d.%m.%Y")
     text = (
-        "📷 *Шаг 1 из 8 — Фото*\n\n"
+        "📷 *Фото букета*\n\n"
         "⚠️ *Важно для защиты от обмана:*\n"
         "Положи рядом с букетом листок с надписью *«ReBloomKZ»* и сегодняшней датой "
         f"(_{today}_), и сфотографируй букет вместе с этой подписью.\n\n"
@@ -246,74 +254,170 @@ async def photos_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.user_data.get("photos"):
         await q.message.reply_text("Сначала отправь хотя бы одно фото 📷")
         return PHOTOS
-    await q.message.reply_text(
-        "🌸 *Шаг 2 из 8*\n\nНапиши *название* (что продаёшь):\n_Напр. Букет из 25 роз_",
-        parse_mode="Markdown")
-    return TITLE
-
-
-async def ad_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["title"] = update.message.text.strip()[:80]
-    await update.message.reply_text(
-        "💰 *Шаг 3 из 8*\n\nУкажи *цену* в тенге:\n_Напр. 8000_", parse_mode="Markdown")
-    return PRICE
-
-
-async def ad_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["price"] = update.message.text.strip()[:20]
-    await update.message.reply_text(
-        "📍 *Шаг 4 из 8*\n\nВ каком *городе*?\n_Напр. Алматы_", parse_mode="Markdown")
-    return CITY
-
-
-async def ad_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["city"] = update.message.text.strip()[:40]
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Низкий · до 30 см", callback_data="size_low")],
-        [InlineKeyboardButton("Средний · 30–50 см", callback_data="size_mid")],
-        [InlineKeyboardButton("Высокий · 50–80 см", callback_data="size_high")],
-        [InlineKeyboardButton("Экстра · более 80 см", callback_data="size_xl")],
-    ])
-    await update.message.reply_text(
-        "📏 *Шаг 5 из 8 — Размер*\n\nВыбери высоту букета:",
-        parse_mode="Markdown", reply_markup=kb)
-    return SIZE
-
-
-async def ad_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    ctx.user_data["size"] = SIZES.get(q.data, "")
-    await q.edit_message_text(f"📏 Размер: {ctx.user_data['size']} ✅")
-    await ctx.bot.send_message(
-        q.message.chat_id,
-        "🌿 *Шаг 6 из 8 — Свежесть*\n\nНасколько свежий букет?\n"
-        "_Напр. собран сегодня, подарили вчера, стоит 2 дня_",
-        parse_mode="Markdown")
-    return FRESH
-
-
-async def ad_fresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["fresh"] = update.message.text.strip()[:120]
-    await update.message.reply_text(
-        "📞 *Шаг 7 из 8*\n\nОставь *телефон* для связи:\n_Напр. +7 707 123 45 67_",
-        parse_mode="Markdown")
-    return PHONE
-
-
-async def ad_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["phone"] = update.message.text.strip()[:30]
+    # сохраняем данные продавца сразу
     u = update.effective_user
     ctx.user_data["seller_id"] = u.id
     ctx.user_data["seller_name"] = u.first_name or "Продавец"
     ctx.user_data["seller_username"] = u.username or ""
+    await send_card(q.message.chat_id, ctx)
+    return CARD
+
+
+# ────────────────────────────────────────────────────────────
+#         КАРТОЧКА-КОНСТРУКТОР (как в узбекском боте)
+# ────────────────────────────────────────────────────────────
+def card_text(d: dict) -> str:
+    """Текст-подпись под фото в карточке-конструкторе."""
+    def v(key, default):
+        return d.get(key) or default
+    return (
+        "📝 *Заполнение объявления*\n\n"
+        f"Название: {v('title', '— не указано')}\n"
+        f"Цена: {v('price', '— не указана')}"
+        + (" ₸" if d.get('price') else "") + "\n"
+        f"Город: {v('city', '— не указан')}\n"
+        f"Размер: {v('size', '— не указан')}\n"
+        f"Свежесть: {v('fresh', '— не указана')}\n"
+        f"Телефон: {v('phone', '— не указан')}\n\n"
+        "Нажимай на кнопки и заполняй поля 👇"
+    )
+
+
+def card_keyboard(d: dict) -> InlineKeyboardMarkup:
+    """Сетка кнопок карточки. ✓ помечает заполненные поля."""
+    def mark(key, label):
+        return f"✓ {label}" if d.get(key) else label
+
+    ready = all(d.get(f) for f in REQUIRED_FIELDS)
+    bottom = (
+        InlineKeyboardButton("✅ Готово, к оплате", callback_data="card_done")
+        if ready else
+        InlineKeyboardButton("⚠️ Заполните данные", callback_data="card_noop")
+    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(mark("title", "🌸 Название"), callback_data="f:title"),
+         InlineKeyboardButton(mark("price", "💰 Цена"),    callback_data="f:price")],
+        [InlineKeyboardButton(mark("city", "📍 Город"),    callback_data="f:city"),
+         InlineKeyboardButton(mark("size", "📏 Размер"),   callback_data="f:size")],
+        [InlineKeyboardButton(mark("fresh", "🌿 Свежесть"), callback_data="f:fresh"),
+         InlineKeyboardButton(mark("phone", "📞 Телефон"),  callback_data="f:phone")],
+        [InlineKeyboardButton("📷 Изменить фото", callback_data="f:photos")],
+        [InlineKeyboardButton("❌ Отменить", callback_data="cancel_ad"), bottom],
+    ])
+
+
+async def send_card(chat_id, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Показывает карточку. Чтобы повторить эффект узбекского бота
+    («старая карточка исчезает, появляется новая, уже заполненная»),
+    перед отправкой новой карточки удаляем предыдущую.
+    """
     d = ctx.user_data
-    await update.message.reply_photo(
-        photo=d["photos"][0], caption=format_ad(d), parse_mode="Markdown")
-    await update.message.reply_text(
+    old_id = d.get("card_msg_id")
+    if old_id:
+        try:
+            await ctx.bot.delete_message(chat_id, old_id)
+        except Exception:
+            pass
+    sent = await ctx.bot.send_photo(
+        chat_id=chat_id,
+        photo=d["photos"][0],
+        caption=card_text(d),
+        parse_mode="Markdown",
+        reply_markup=card_keyboard(d),
+    )
+    d["card_msg_id"] = sent.message_id
+
+
+async def card_noop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    missing = [name for f, name in [
+        ("title", "название"), ("price", "цена"), ("city", "город"),
+        ("size", "размер"), ("fresh", "свежесть"), ("phone", "телефон"),
+    ] if not ctx.user_data.get(f)]
+    await q.answer("Заполните: " + ", ".join(missing), show_alert=True)
+    return CARD
+
+
+# нажата кнопка поля в карточке
+async def card_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    field = q.data.split(":", 1)[1]
+    ctx.user_data["editing_field"] = field
+
+    if field == "photos":
+        # вернуться к добавлению фото заново
+        ctx.user_data["photos"] = []
+        await q.message.reply_text(
+            "📷 Пришли новое фото (можно до 5). Когда закончишь — нажми «Готово с фото».",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("✅ Готово с фото", callback_data="photos_done")]]))
+        return PHOTOS
+
+    if field == "size":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Низкий · до 30 см", callback_data="size_low")],
+            [InlineKeyboardButton("Средний · 30–50 см", callback_data="size_mid")],
+            [InlineKeyboardButton("Высокий · 50–80 см", callback_data="size_high")],
+            [InlineKeyboardButton("Экстра · более 80 см", callback_data="size_xl")],
+        ])
+        await q.message.reply_text("📏 Выбери высоту букета:", reply_markup=kb)
+        return WAIT_VAL
+
+    prompts = {
+        "title": "🌸 Напиши *название* (что продаёшь):\n_Напр. Букет из 25 роз_",
+        "price": "💰 Укажи *цену* в тенге:\n_Напр. 8000_",
+        "city":  "📍 В каком *городе*?\n_Напр. Алматы_",
+        "fresh": "🌿 Насколько *свежий* букет?\n_Напр. собран сегодня, стоит 2 дня_",
+        "phone": "📞 Оставь *телефон* для связи:\n_Напр. +7 707 123 45 67_",
+    }
+    await q.message.reply_text(prompts[field], parse_mode="Markdown")
+    return WAIT_VAL
+
+
+# выбран размер (кнопкой)
+async def card_set_size(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data["size"] = SIZES.get(q.data, "")
+    try:
+        await q.message.delete()  # убираем сообщение со списком размеров
+    except Exception:
+        pass
+    await send_card(q.message.chat_id, ctx)
+    return CARD
+
+
+# получен текстовый ввод значения поля
+async def card_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    field = ctx.user_data.get("editing_field")
+    text = update.message.text.strip()
+    limits = {"title": 80, "price": 20, "city": 40, "fresh": 120, "phone": 30}
+    if field in limits:
+        ctx.user_data[field] = text[:limits[field]]
+    # удаляем сообщение пользователя, чтобы чат оставался чистым
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+    await send_card(update.effective_chat.id, ctx)
+    return CARD
+
+
+# нажата «Готово, к оплате» — переход к твоему блоку оплаты
+async def card_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    d = ctx.user_data
+    if not all(d.get(f) for f in REQUIRED_FIELDS):
+        await q.answer("Сначала заполните все поля", show_alert=True)
+        return CARD
+    await ctx.bot.send_message(
+        q.message.chat_id,
         f"👆 Так будет выглядеть объявление ({len(d['photos'])} фото).\n\n"
         "━━━━━━━━━━━━━━━\n"
-        "💳 *Шаг 8 из 8 — Оплата публикации*\n\n"
+        "💳 *Оплата публикации*\n\n"
         f"Публикация объявления стоит *{PAY_AMOUNT} ₸*.\n\n"
         "*Как оплатить:*\n"
         f"1️⃣ Переведите *{PAY_AMOUNT} ₸* на Kaspi:\n"
@@ -409,8 +513,16 @@ async def send_to_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cancel_ad_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    # удаляем карточку, если она ещё висит
+    card_id = ctx.user_data.get("card_msg_id")
+    if card_id:
+        try:
+            await ctx.bot.delete_message(q.message.chat_id, card_id)
+        except Exception:
+            pass
     ctx.user_data.clear()
     await q.message.reply_text("❌ Отменено. /start — начать заново.")
+    return ConversationHandler.END
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -527,15 +639,22 @@ def main():
                 MessageHandler(filters.PHOTO, ad_photo),
                 CallbackQueryHandler(photos_done, pattern="^photos_done$"),
             ],
-            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_title)],
-            PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_price)],
-            CITY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_city)],
-            SIZE:  [CallbackQueryHandler(ad_size, pattern="^size_")],
-            FRESH: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_fresh)],
-            PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_phone)],
+            CARD: [
+                CallbackQueryHandler(card_field, pattern="^f:"),
+                CallbackQueryHandler(card_done, pattern="^card_done$"),
+                CallbackQueryHandler(card_noop, pattern="^card_noop$"),
+            ],
+            WAIT_VAL: [
+                CallbackQueryHandler(card_set_size, pattern="^size_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, card_value),
+            ],
             PAYMENT: [MessageHandler((filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, ad_payment)],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cmd_cancel),
+            CallbackQueryHandler(cancel_ad_btn, pattern="^cancel_ad$"),
+        ],
+        per_message=False,
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -543,7 +662,6 @@ def main():
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(send_to_moderation, pattern="^send_mod$"))
-    app.add_handler(CallbackQueryHandler(cancel_ad_btn, pattern="^cancel_ad$"))
     app.add_handler(CallbackQueryHandler(on_moderation, pattern="^(approve|reject)$"))
     app.add_handler(CallbackQueryHandler(on_mark_sold, pattern="^mark_sold$"))
     app.add_handler(CallbackQueryHandler(on_menu, pattern="^how$"))
