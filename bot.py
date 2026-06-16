@@ -231,39 +231,49 @@ async def ad_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["photos"] = []
     today = datetime.now().strftime("%d.%m.%Y")
     text = (
-        "📷 *Фото букета*\n\n"
-        "⚠️ *Важно для защиты от обмана:*\n"
-        "Положи рядом с букетом листок с надписью *«ReBloomKZ»* и сегодняшней датой "
-        f"(_{today}_), и сфотографируй букет вместе с этой подписью.\n\n"
-        "Так покупатели будут уверены, что букет настоящий и у тебя на руках.\n\n"
-        "📸 Отправь фото (можно несколько, до 5).\n"
-        "Когда закончишь — нажми «Готово с фото»."
+        "*Фото букета*\n"
+        "─────────────\n"
+        "Для защиты от обмана положите рядом с букетом листок с надписью "
+        f"*«ReBloomKZ»* и сегодняшней датой (_{today}_) и сфотографируйте букет "
+        "вместе с этой подписью.\n\n"
+        "Так покупатели будут уверены, что букет настоящий и у вас на руках.\n\n"
+        "Отправьте фото (можно несколько, до 5). Кнопка «Готово» появится "
+        "после первого фото."
     )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Готово с фото", callback_data="photos_done")]])
     if update.callback_query:
         await update.callback_query.answer()
         await ctx.bot.send_message(update.callback_query.message.chat_id, text,
-                                   parse_mode="Markdown", reply_markup=kb)
+                                   parse_mode="Markdown")
     else:
-        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+        await update.message.reply_text(text, parse_mode="Markdown")
     return PHOTOS
 
 
 async def ad_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
-        await update.message.reply_text("Пожалуйста, отправь фото 📷 (или нажми «Готово с фото»)")
+        await update.message.reply_text("Пожалуйста, отправьте фото (или нажмите «Готово с фото»)")
         return PHOTOS
     photos = ctx.user_data.setdefault("photos", [])
     if len(photos) >= MAX_PHOTOS:
-        await update.message.reply_text(f"Уже {MAX_PHOTOS} фото. Нажми «Готово с фото».")
+        await update.message.reply_text(f"Уже {MAX_PHOTOS} фото. Нажмите «Готово с фото».")
         return PHOTOS
     photos.append(update.message.photo[-1].file_id)
     left = MAX_PHOTOS - len(photos)
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Готово с фото", callback_data="photos_done")]])
-    await update.message.reply_text(
-        f"✅ Фото добавлено ({len(photos)}/{MAX_PHOTOS}).\n"
-        + (f"Можно ещё {left}, или нажми «Готово»." if left else "Это максимум. Нажми «Готово»."),
+
+    # убираем предыдущую подсказку с кнопкой, чтобы не плодились дубли «Готово с фото»
+    prev = ctx.user_data.get("photo_prompt_id")
+    if prev:
+        try:
+            await ctx.bot.delete_message(update.effective_chat.id, prev)
+        except Exception:
+            pass
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Готово с фото", callback_data="photos_done")]])
+    sent = await update.message.reply_text(
+        f"Фото добавлено ({len(photos)}/{MAX_PHOTOS}).\n"
+        + (f"Можно ещё {left}, или нажмите «Готово»." if left else "Это максимум. Нажмите «Готово»."),
         reply_markup=kb)
+    ctx.user_data["photo_prompt_id"] = sent.message_id
     return PHOTOS
 
 
@@ -271,8 +281,14 @@ async def photos_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     if not ctx.user_data.get("photos"):
-        await q.message.reply_text("Сначала отправь хотя бы одно фото 📷")
+        await q.answer("Сначала отправьте хотя бы одно фото", show_alert=True)
         return PHOTOS
+    # убираем подсказку с кнопкой
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    ctx.user_data.pop("photo_prompt_id", None)
     # сохраняем данные продавца сразу
     u = update.effective_user
     ctx.user_data["seller_id"] = u.id
@@ -709,6 +725,18 @@ async def on_mark_sold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db_mark_sold(q.message.message_id)
 
 
+# Страховка: если бот перезапустился (Railway сбросил состояние в памяти),
+# старые кнопки объявления перестают ловиться диалогом. Этот глобальный
+# обработчик ловит их и подсказывает начать заново, вместо «вечной загрузки».
+async def orphan_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Сессия устарела. Нажмите /start, чтобы начать заново.", show_alert=True)
+    try:
+        await q.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
 # ════════════════════════════════════════════════════════════
 def main():
     db_init()   # создаём таблицы при старте
@@ -740,6 +768,7 @@ def main():
             CallbackQueryHandler(cancel_ad_btn, pattern="^cancel_ad$"),
         ],
         per_message=False,
+        allow_reentry=True,
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -750,6 +779,8 @@ def main():
     app.add_handler(CallbackQueryHandler(on_moderation, pattern="^(approve|reject)$"))
     app.add_handler(CallbackQueryHandler(on_mark_sold, pattern="^mark_sold$"))
     app.add_handler(CallbackQueryHandler(on_menu, pattern="^how$"))
+    # САМЫМ ПОСЛЕДНИМ — ловит «осиротевшие» кнопки после перезапуска бота
+    app.add_handler(CallbackQueryHandler(orphan_callback))
 
     logger.info("✅ ReBloomKZ бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
