@@ -25,7 +25,14 @@ ADMIN_ID   = int(os.environ.get("ADMIN_ID", "0"))
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 DB_URL     = os.environ.get("DATABASE_URL", "")
 
-# реквизиты для оплаты публикации
+# ─────────────────────────────────────────────────────────────
+# ОПЛАТА ПУБЛИКАЦИИ — включить/выключить одной строкой.
+#   False — объявления бесплатные, сразу идут на модерацию (для старта).
+#   True  — включается приём чека об оплате перед модерацией.
+PAYMENT_ENABLED = False
+# ─────────────────────────────────────────────────────────────
+
+# реквизиты для оплаты публикации (используются, когда PAYMENT_ENABLED = True)
 PAY_AMOUNT = "750"
 PAY_PHONE  = "+7 702 261 62 15"
 PAY_NAME   = "Meiramkul"
@@ -187,6 +194,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pay_line = (f"5.  Оплатите публикацию ({PAY_AMOUNT} ₸) и пришлите чек\n"
+                "6.  Дождитесь проверки — объявление появится в канале\n"
+                if PAYMENT_ENABLED else
+                "5.  Дождитесь проверки — объявление появится в канале\n")
     await update.message.reply_text(
         "*Как подать объявление*\n"
         "─────────────\n"
@@ -194,8 +205,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "2.  При желании добавьте ещё фото (до 5)\n"
         "3.  Заполните название, цену, город, размер, свежесть\n"
         "4.  Оставьте телефон\n"
-        f"5.  Оплатите публикацию ({PAY_AMOUNT} ₸) и пришлите чек\n"
-        "6.  Дождитесь проверки — объявление появится в канале\n"
+        + pay_line +
         "─────────────\n"
         "Когда букет продан — нажмите «Продано» под своим объявлением.\n\n"
         "/start — начать\n/cancel — отменить",
@@ -206,13 +216,15 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     if q.data == "how":
+        pay_line = (f"• Оплачиваете публикацию ({PAY_AMOUNT} ₸) и присылаете чек\n"
+                    if PAYMENT_ENABLED else "")
         await q.message.reply_text(
             "*Как всё устроено*\n"
             "─────────────\n"
             "• Вы фотографируете букет с подписью на бумаге «ReBloomKZ» и датой "
             "(защита от обмана — подтверждает, что букет реальный и у вас на руках)\n"
             "• Заполняете анкету\n"
-            f"• Оплачиваете публикацию ({PAY_AMOUNT} ₸) и присылаете чек\n"
+            + pay_line +
             "• Мы проверяем\n"
             "• Объявление публикуется в канале с вашим контактом\n"
             "• Покупатели пишут вам напрямую\n"
@@ -507,7 +519,7 @@ async def card_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return CARD
 
 
-# нажата «Готово, к оплате» — переход к твоему блоку оплаты
+# нажата «Опубликовать»
 async def card_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -515,6 +527,16 @@ async def card_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not all(d.get(f) for f in REQUIRED_FIELDS):
         await q.answer("Сначала заполните все поля", show_alert=True)
         return CARD
+
+    # ── ОПЛАТА ВЫКЛЮЧЕНА: сразу на модерацию, без чека ──
+    if not PAYMENT_ENABLED:
+        await _submit_to_moderation(q.message.chat_id, ctx)
+        await q.message.reply_text(
+            "Объявление отправлено на проверку.\n"
+            "После одобрения модератором оно появится в канале.")
+        return ConversationHandler.END
+
+    # ── ОПЛАТА ВКЛЮЧЕНА: показываем реквизиты и ждём чек ──
     await ctx.bot.send_message(
         q.message.chat_id,
         f"Так будет выглядеть объявление ({len(d['photos'])} фото).\n\n"
@@ -577,12 +599,11 @@ def format_ad(d):
     return txt
 
 
-async def send_to_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
+async def _submit_to_moderation(chat_id, ctx: ContextTypes.DEFAULT_TYPE):
+    """Отправляет объявление модератору. Чек прикладывается только если оплата включена."""
     d = dict(ctx.user_data)
     if not ADMIN_ID:
-        await q.message.reply_text("Модератор не настроен.")
+        await ctx.bot.send_message(chat_id, "Модератор не настроен.")
         return
     photos = d["photos"]
     if len(photos) > 1:
@@ -599,16 +620,24 @@ async def send_to_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]))
     # сохраняем заявку в БАЗУ (а не в память!)
     db_save_pending(sent.message_id, d)
-    # чек об оплате
-    try:
-        if d.get("receipt_type") == "photo":
-            await ctx.bot.send_photo(chat_id=ADMIN_ID, photo=d["receipt_id"],
-                caption=f"Чек об оплате ({PAY_AMOUNT} ₸ на {PAY_PHONE})")
-        elif d.get("receipt_type") == "doc":
-            await ctx.bot.send_document(chat_id=ADMIN_ID, document=d["receipt_id"],
-                caption=f"Чек об оплате ({PAY_AMOUNT} ₸ на {PAY_PHONE})")
-    except Exception as e:
-        logger.error(f"receipt err: {e}")
+    # чек об оплате — только когда оплата включена
+    if PAYMENT_ENABLED:
+        try:
+            if d.get("receipt_type") == "photo":
+                await ctx.bot.send_photo(chat_id=ADMIN_ID, photo=d["receipt_id"],
+                    caption=f"Чек об оплате ({PAY_AMOUNT} ₸ на {PAY_PHONE})")
+            elif d.get("receipt_type") == "doc":
+                await ctx.bot.send_document(chat_id=ADMIN_ID, document=d["receipt_id"],
+                    caption=f"Чек об оплате ({PAY_AMOUNT} ₸ на {PAY_PHONE})")
+        except Exception as e:
+            logger.error(f"receipt err: {e}")
+
+
+async def send_to_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # используется в платном режиме (после получения чека)
+    q = update.callback_query
+    await q.answer()
+    await _submit_to_moderation(q.message.chat_id, ctx)
     await q.message.reply_text(
         "Объявление и чек отправлены на проверку.\n"
         "После подтверждения оплаты оно появится в канале.")
