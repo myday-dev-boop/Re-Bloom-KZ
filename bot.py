@@ -26,7 +26,7 @@ CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 DB_URL     = os.environ.get("DATABASE_URL", "")
 
 # реквизиты для оплаты публикации
-PAY_AMOUNT = "1000"
+PAY_AMOUNT = "750"
 PAY_PHONE  = "+7 702 261 62 15"
 PAY_NAME   = "Meiramkul"
 
