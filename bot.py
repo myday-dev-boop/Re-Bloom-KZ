@@ -175,29 +175,30 @@ def db_mark_sold(channel_msg_id):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "друг"
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌷 Подать объявление", callback_data="new_ad")],
-        [InlineKeyboardButton("ℹ️ Как это работает", callback_data="how")],
+        [InlineKeyboardButton("Подать объявление", callback_data="new_ad")],
+        [InlineKeyboardButton("Как это работает", callback_data="how")],
     ])
     await update.message.reply_text(
-        f"👋 Привет, {name}!\n\n"
-        "Это *ReBloomKZ* — площадка для продажи цветов и букетов 🌸\n\n"
-        "Подай объявление — после проверки оно появится в нашем канале, "
-        "где его увидят покупатели.\n\n"
-        "Нажми кнопку, чтобы начать:",
+        f"Здравствуйте, {name}.\n\n"
+        "*ReBloomKZ* — площадка для продажи цветов и букетов.\n\n"
+        "Подайте объявление — после проверки оно появится в нашем канале, "
+        "где его увидят покупатели.",
         reply_markup=kb, parse_mode="Markdown")
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🌷 *Как подать объявление:*\n\n"
-        "1️⃣ Сфоткай букет с подписью «ReBloomKZ» и датой\n"
-        "2️⃣ Можно добавить несколько фото (до 5)\n"
-        "3️⃣ Заполни название, цену, город, размер, свежесть\n"
-        "4️⃣ Оставь телефон\n"
-        f"5️⃣ Оплати публикацию ({PAY_AMOUNT}₸) и пришли чек\n"
-        "6️⃣ Жди проверки — и объявление в канале!\n\n"
-        "Когда букет продан — нажми «✅ Продано» под своим объявлением.\n\n"
-        "*/start* — начать\n*/cancel* — отменить",
+        "*Как подать объявление*\n"
+        "─────────────\n"
+        "1.  Сфотографируйте букет с подписью «ReBloomKZ» и датой\n"
+        "2.  При желании добавьте ещё фото (до 5)\n"
+        "3.  Заполните название, цену, город, размер, свежесть\n"
+        "4.  Оставьте телефон\n"
+        f"5.  Оплатите публикацию ({PAY_AMOUNT} ₸) и пришлите чек\n"
+        "6.  Дождитесь проверки — объявление появится в канале\n"
+        "─────────────\n"
+        "Когда букет продан — нажмите «Продано» под своим объявлением.\n\n"
+        "/start — начать\n/cancel — отменить",
         parse_mode="Markdown")
 
 
@@ -206,21 +207,24 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     if q.data == "how":
         await q.message.reply_text(
-            "🌷 Как всё устроено:\n\n"
-            "• Ты фотографируешь букет с подписью на бумаге «ReBloomKZ» и датой "
-            "(защита от обмана — подтверждает, что букет реальный и у тебя на руках)\n"
-            "• Заполняешь анкету\n"
-            f"• Оплачиваешь публикацию ({PAY_AMOUNT}₸) и присылаешь чек\n"
+            "*Как всё устроено*\n"
+            "─────────────\n"
+            "• Вы фотографируете букет с подписью на бумаге «ReBloomKZ» и датой "
+            "(защита от обмана — подтверждает, что букет реальный и у вас на руках)\n"
+            "• Заполняете анкету\n"
+            f"• Оплачиваете публикацию ({PAY_AMOUNT} ₸) и присылаете чек\n"
             "• Мы проверяем\n"
-            "• Объявление публикуется в канале с твоим контактом\n"
-            "• Покупатели пишут тебе напрямую\n"
-            "• Продал — нажал «Продано», и объявление помечается\n\n"
-            "Нажми /start чтобы начать!")
+            "• Объявление публикуется в канале с вашим контактом\n"
+            "• Покупатели пишут вам напрямую\n"
+            "• Продали — нажали «Продано», объявление помечается\n"
+            "─────────────\n"
+            "Нажмите /start, чтобы начать.",
+            parse_mode="Markdown")
 
 
 async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"🆔 Твой Telegram ID: `{update.effective_user.id}`", parse_mode="Markdown")
+        f"Ваш Telegram ID: `{update.effective_user.id}`", parse_mode="Markdown")
 
 
 # ════════════════════════════════════════════════════════════
@@ -513,17 +517,17 @@ async def card_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return CARD
     await ctx.bot.send_message(
         q.message.chat_id,
-        f"👆 Так будет выглядеть объявление ({len(d['photos'])} фото).\n\n"
-        "━━━━━━━━━━━━━━━\n"
-        "💳 *Оплата публикации*\n\n"
-        f"Публикация объявления стоит *{PAY_AMOUNT} ₸*.\n\n"
-        "*Как оплатить:*\n"
-        f"1️⃣ Переведите *{PAY_AMOUNT} ₸* на Kaspi:\n"
-        f"📱 `{PAY_PHONE}`\n"
-        f"👤 Получатель: *{PAY_NAME}*\n\n"
-        "2️⃣ В Kaspi откройте чек перевода → нажмите *«Поделиться»* → "
-        "сохраните чек (PDF или картинку)\n\n"
-        "3️⃣ Пришлите этот *чек* сюда (файлом или фото) 👇\n\n"
+        f"Так будет выглядеть объявление ({len(d['photos'])} фото).\n\n"
+        "─────────────\n"
+        "*Оплата публикации*\n\n"
+        f"Стоимость размещения — *{PAY_AMOUNT} ₸*.\n\n"
+        "*Шаг 1.*  Переведите сумму на Kaspi:\n"
+        f"`{PAY_PHONE}`\n"
+        f"Получатель: *{PAY_NAME}*\n\n"
+        "*Шаг 2.*  Откройте чек перевода в Kaspi, нажмите «Поделиться» "
+        "и сохраните его (PDF или фото).\n\n"
+        "*Шаг 3.*  Пришлите чек сюда — файлом или фото.\n"
+        "─────────────\n"
         "_Чек проверит модератор перед публикацией._",
         parse_mode="Markdown")
     return PAYMENT
@@ -544,10 +548,10 @@ async def ad_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["receipt_type"] = receipt[0]
     ctx.user_data["receipt_id"] = receipt[1]
     await msg.reply_text(
-        "✅ Чек получен!\n\nОтправляем объявление на проверку?",
+        "Чек получен. Отправляем объявление на проверку?",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Отправить на проверку", callback_data="send_mod")],
-            [InlineKeyboardButton("❌ Отменить", callback_data="cancel_ad")],
+            [InlineKeyboardButton("Отправить на проверку", callback_data="send_mod")],
+            [InlineKeyboardButton("Отменить", callback_data="cancel_ad")],
         ]))
     return ConversationHandler.END
 
@@ -558,16 +562,18 @@ def format_ad(d):
         price = f"{int(''.join(c for c in price if c.isdigit())):,}".replace(",", " ")
     except:
         pass
-    txt = f"🌸 *{d['title']}*\n\n"
-    txt += f"💰 Цена: *{price} ₸*\n"
-    txt += f"📍 Город: {d['city']}\n"
+    txt = f"*{d['title']}*\n"
+    txt += "─────────────\n"
+    txt += f"*Цена:*  {price} ₸\n"
+    txt += f"*Город:*  {d['city']}\n"
     if d.get("size"):
-        txt += f"📏 Размер: {d['size']}\n"
+        txt += f"*Размер:*  {d['size']}\n"
     if d.get("fresh"):
-        txt += f"🌿 Свежесть: {d['fresh']}\n"
-    txt += f"\n📞 Связь: {d['phone']}"
+        txt += f"*Свежесть:*  {d['fresh']}\n"
+    txt += "─────────────\n"
+    txt += f"*Связь:*  {d['phone']}"
     if d.get("seller_username"):
-        txt += f"\n💬 Telegram: @{d['seller_username']}"
+        txt += f"\n*Telegram:*  @{d['seller_username']}"
     return txt
 
 
@@ -576,7 +582,7 @@ async def send_to_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     d = dict(ctx.user_data)
     if not ADMIN_ID:
-        await q.message.reply_text("⚠️ Модератор не настроен.")
+        await q.message.reply_text("Модератор не настроен.")
         return
     photos = d["photos"]
     if len(photos) > 1:
@@ -588,8 +594,8 @@ async def send_to_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sent = await ctx.bot.send_photo(
         chat_id=ADMIN_ID, photo=photos[0], caption=caption, parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Одобрить", callback_data="approve"),
-             InlineKeyboardButton("❌ Отклонить", callback_data="reject")],
+            [InlineKeyboardButton("Одобрить", callback_data="approve"),
+             InlineKeyboardButton("Отклонить", callback_data="reject")],
         ]))
     # сохраняем заявку в БАЗУ (а не в память!)
     db_save_pending(sent.message_id, d)
@@ -597,15 +603,15 @@ async def send_to_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         if d.get("receipt_type") == "photo":
             await ctx.bot.send_photo(chat_id=ADMIN_ID, photo=d["receipt_id"],
-                caption=f"💳 Чек об оплате ({PAY_AMOUNT}₸ на {PAY_PHONE})")
+                caption=f"Чек об оплате ({PAY_AMOUNT} ₸ на {PAY_PHONE})")
         elif d.get("receipt_type") == "doc":
             await ctx.bot.send_document(chat_id=ADMIN_ID, document=d["receipt_id"],
-                caption=f"💳 Чек об оплате ({PAY_AMOUNT}₸ на {PAY_PHONE})")
+                caption=f"Чек об оплате ({PAY_AMOUNT} ₸ на {PAY_PHONE})")
     except Exception as e:
         logger.error(f"receipt err: {e}")
     await q.message.reply_text(
-        "✅ Объявление и чек отправлены на проверку!\n"
-        "После подтверждения оплаты объявление появится в канале. 🌷")
+        "Объявление и чек отправлены на проверку.\n"
+        "После подтверждения оплаты оно появится в канале.")
 
 
 async def cancel_ad_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -619,13 +625,13 @@ async def cancel_ad_btn(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     ctx.user_data.clear()
-    await q.message.reply_text("❌ Отменено. /start — начать заново.")
+    await q.message.reply_text("Отменено. /start — начать заново.")
     return ConversationHandler.END
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
-    await update.message.reply_text("❌ Отменено. /start — начать заново.")
+    await update.message.reply_text("Отменено. /start — начать заново.")
     return ConversationHandler.END
 
 
@@ -639,12 +645,12 @@ async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     d = db_get_pending(msg_id)        # читаем из БАЗЫ
     if not d:
         await q.edit_message_caption(
-            caption=(q.message.caption or "") + "\n\n⚠️ Данные устарели.", parse_mode="Markdown")
+            caption=(q.message.caption or "") + "\n\nДанные устарели.", parse_mode="Markdown")
         return
 
     if q.data == "approve":
         if not CHANNEL_ID:
-            await q.message.reply_text("⚠️ CHANNEL_ID не настроен!")
+            await q.message.reply_text("CHANNEL_ID не настроен!")
             return
         try:
             photos = d["photos"]
@@ -662,24 +668,24 @@ async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # сохраняем опубликованное в БАЗУ
             db_save_published(sent.message_id, d["seller_id"], sent.chat_id, is_caption)
             await q.edit_message_caption(
-                caption=(q.message.caption or "") + "\n\n✅ *ОПУБЛИКОВАНО*", parse_mode="Markdown")
+                caption=(q.message.caption or "") + "\n\n*ОПУБЛИКОВАНО*", parse_mode="Markdown")
             try:
                 await ctx.bot.send_message(d["seller_id"],
-                    "🎉 Твоё объявление одобрено и опубликовано в канале!\n"
-                    "Когда продашь — нажми «✅ Продано» под объявлением в канале. Удачи! 🌷")
+                    "Ваше объявление одобрено и опубликовано в канале.\n"
+                    "Когда продадите — нажмите «Продано» под объявлением в канале.")
             except:
                 pass
         except Exception as e:
             logger.error(f"publish err: {e}")
-            await q.message.reply_text(f"❌ Ошибка публикации: {e}")
+            await q.message.reply_text(f"Ошибка публикации: {e}")
     elif q.data == "reject":
         await q.edit_message_caption(
-            caption=(q.message.caption or "") + "\n\n❌ *ОТКЛОНЕНО*", parse_mode="Markdown")
+            caption=(q.message.caption or "") + "\n\n*ОТКЛОНЕНО*", parse_mode="Markdown")
         try:
             await ctx.bot.send_message(d["seller_id"],
-                "К сожалению, объявление не прошло проверку. 😔\n"
+                "К сожалению, объявление не прошло проверку.\n"
                 "Возможно, нет подписи «ReBloomKZ» на фото, не хватает данных или оплаты. "
-                "Попробуй снова через /start")
+                "Попробуйте снова через /start")
         except:
             pass
     db_del_pending(msg_id)
@@ -692,12 +698,12 @@ def channel_buttons(d, sold=False):
     phone_digits = "".join(c for c in d["phone"] if c.isdigit())
     row = []
     if phone_digits:
-        row.append(InlineKeyboardButton("💬 WhatsApp", url=f"https://wa.me/{phone_digits}"))
+        row.append(InlineKeyboardButton("WhatsApp", url=f"https://wa.me/{phone_digits}"))
     if d.get("seller_username"):
-        row.append(InlineKeyboardButton("✈️ Написать", url=f"https://t.me/{d['seller_username']}"))
+        row.append(InlineKeyboardButton("Telegram", url=f"https://t.me/{d['seller_username']}"))
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("✅ Продано (для продавца)", callback_data="mark_sold")])
+    rows.append([InlineKeyboardButton("Продано (для продавца)", callback_data="mark_sold")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -710,15 +716,15 @@ async def on_mark_sold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if q.from_user.id != info["seller_id"] and q.from_user.id != ADMIN_ID:
         await q.answer("Только продавец может отметить «Продано».", show_alert=True)
         return
-    await q.answer("Отмечено как продано ✅")
+    await q.answer("Отмечено как продано")
     try:
         if info["is_caption"]:
             await q.edit_message_caption(
-                caption="❌ *ПРОДАНО*\n\n" + (q.message.caption or ""),
+                caption="*ПРОДАНО*\n\n" + (q.message.caption or ""),
                 parse_mode="Markdown", reply_markup=None)
         else:
             await q.edit_message_text(
-                text="❌ *ПРОДАНО*\n\n" + (q.message.text or ""),
+                text="*ПРОДАНО*\n\n" + (q.message.text or ""),
                 parse_mode="Markdown", reply_markup=None)
     except Exception as e:
         logger.error(f"mark sold err: {e}")
