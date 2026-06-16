@@ -310,6 +310,9 @@ async def photos_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.user_data.get("photos"):
         await q.answer("Сначала отправьте хотя бы одно фото", show_alert=True)
         return PHOTOS
+    # ВРЕМЕННАЯ ДИАГНОСТИКА
+    n = len(ctx.user_data.get("photos", []))
+    logger.info(f"PHOTOS_DONE: collected = {n}")
     # убираем подсказку с кнопкой
     try:
         await q.message.delete()
@@ -334,9 +337,12 @@ def card_text(d: dict) -> str:
         return d.get(key) or default
     price = d.get("price")
     price_line = f"{price} ₸" if price else "—"
+    n_photos = len(d.get("photos", []))
+    photo_line = f"*Фото:*  {n_photos} шт." if n_photos else "*Фото:*  —"
     return (
         "*Объявление*\n"
         "─────────────\n"
+        f"{photo_line}\n"
         f"*Название:*  {v('title', '—')}\n"
         f"*Цена:*  {price_line}\n"
         f"*Город:*  {v('city', '—')}\n"
@@ -344,7 +350,7 @@ def card_text(d: dict) -> str:
         f"*Свежесть:*  {v('fresh', '—')}\n"
         f"*Телефон:*  {v('phone', '—')}\n"
         "─────────────\n"
-        "_Нажмите на поле ниже, чтобы заполнить его._"
+        "_В объявлении покажутся все фото. Нажмите на поле ниже, чтобы заполнить его._"
     )
 
 
@@ -696,6 +702,9 @@ async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         try:
             photos = d["photos"]
+            # ВРЕМЕННАЯ ДИАГНОСТИКА: показываем, сколько фото реально дошло до публикации
+            logger.info(f"PUBLISH: photos count = {len(photos)} | ids = {photos}")
+            await q.message.reply_text(f"Публикую фото: {len(photos)} шт.")
             if len(photos) > 1:
                 await ctx.bot.send_media_group(chat_id=CHANNEL_ID, media=[InputMediaPhoto(p) for p in photos])
                 sent = await ctx.bot.send_message(
