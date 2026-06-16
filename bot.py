@@ -269,26 +269,37 @@ async def ad_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message.photo:
         await update.message.reply_text("Пожалуйста, отправьте фото (или нажмите «Готово с фото»)")
         return PHOTOS
+
     photos = ctx.user_data.setdefault("photos", [])
     if len(photos) >= MAX_PHOTOS:
-        await update.message.reply_text(f"Уже {MAX_PHOTOS} фото. Нажмите «Готово с фото».")
+        if not ctx.user_data.get("_warned_max"):
+            ctx.user_data["_warned_max"] = True
+            await update.message.reply_text(
+                f"Можно максимум {MAX_PHOTOS} фото — лишние не добавлены. Нажмите «Готово с фото».")
         return PHOTOS
-    photos.append(update.message.photo[-1].file_id)
-    left = MAX_PHOTOS - len(photos)
 
-    # убираем предыдущую подсказку с кнопкой, чтобы не плодились дубли «Готово с фото»
-    prev = ctx.user_data.get("photo_prompt_id")
-    if prev:
+    photos.append(update.message.photo[-1].file_id)
+    count = len(photos)
+    left = MAX_PHOTOS - count
+    chat_id = update.effective_chat.id
+
+    text = (f"Фото добавлено ({count}/{MAX_PHOTOS}).\n"
+            + (f"Можно ещё {left}, или нажмите «Готово»." if left else "Это максимум. Нажмите «Готово»."))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Готово с фото", callback_data="photos_done")]])
+
+    # Если подсказка уже есть — просто обновляем счётчик в ней (важно для альбомов:
+    # 4 фото из одного альбома обновят одно сообщение, а не создадут 4 дубля кнопки).
+    prompt_id = ctx.user_data.get("photo_prompt_id")
+    if prompt_id:
         try:
-            await ctx.bot.delete_message(update.effective_chat.id, prev)
+            await ctx.bot.edit_message_text(chat_id=chat_id, message_id=prompt_id,
+                                             text=text, reply_markup=kb)
+            return PHOTOS
         except Exception:
+            # сообщение не удалось отредактировать (например, текст совпал) — создадим новое
             pass
 
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Готово с фото", callback_data="photos_done")]])
-    sent = await update.message.reply_text(
-        f"Фото добавлено ({len(photos)}/{MAX_PHOTOS}).\n"
-        + (f"Можно ещё {left}, или нажмите «Готово»." if left else "Это максимум. Нажмите «Готово»."),
-        reply_markup=kb)
+    sent = await ctx.bot.send_message(chat_id, text, reply_markup=kb)
     ctx.user_data["photo_prompt_id"] = sent.message_id
     return PHOTOS
 
@@ -401,8 +412,10 @@ async def card_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["editing_field"] = field
 
     if field == "photos":
-        # вернуться к добавлению фото заново
+        # вернуться к добавлению фото заново — сбрасываем счётчик и флаги
         ctx.user_data["photos"] = []
+        ctx.user_data.pop("photo_prompt_id", None)
+        ctx.user_data.pop("_warned_max", None)
         await q.message.reply_text(
             "Пришлите новое фото (можно до 5). Когда закончите — нажмите «Готово с фото».",
             reply_markup=InlineKeyboardMarkup(
