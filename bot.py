@@ -17,6 +17,10 @@ from telegram.ext import (
     CallbackQueryHandler, ConversationHandler, filters, ContextTypes
 )
 
+# Firebase — для чтения заявок из веб-приложения ReBloomKZ
+import firebase_admin
+from firebase_admin import credentials, db as fbdb
+
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -24,6 +28,21 @@ TOKEN      = os.environ["TELEGRAM_TOKEN"]
 ADMIN_ID   = int(os.environ.get("ADMIN_ID", "0"))
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 DB_URL     = os.environ.get("DATABASE_URL", "")
+
+# ── Firebase: ключ из переменной окружения FIREBASE_CREDENTIALS (JSON-строка) ──
+FIREBASE_DB_URL = "https://rebloomkz-97ca0-default-rtdb.europe-west1.firebasedatabase.app"
+FIREBASE_OK = False
+try:
+    _cred_json = os.environ.get("FIREBASE_CREDENTIALS", "").strip()
+    if _cred_json:
+        _cred = credentials.Certificate(json.loads(_cred_json))
+        firebase_admin.initialize_app(_cred, {"databaseURL": FIREBASE_DB_URL})
+        FIREBASE_OK = True
+        logger.info("✅ Firebase подключён")
+    else:
+        logger.warning("⚠️ FIREBASE_CREDENTIALS не задана — модерация из приложения отключена")
+except Exception as e:
+    logger.error(f"Firebase init error: {e}")
 
 # ─────────────────────────────────────────────────────────────
 # ОПЛАТА ПУБЛИКАЦИИ — включить/выключить одной строкой.
@@ -795,6 +814,168 @@ async def orphan_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ════════════════════════════════════════════════════════════
+#   МОДЕРАЦИЯ ЗАЯВОК ИЗ ВЕБ-ПРИЛОЖЕНИЯ (Firebase)
+# ════════════════════════════════════════════════════════════
+def fb_format_ad(p: dict) -> str:
+    """Текст карточки заявки из приложения."""
+    price = p.get("price", 0)
+    try:
+        price = f"{int(price):,}".replace(",", " ")
+    except Exception:
+        pass
+    lines = [
+        f"*{p.get('name','Без названия')}*",
+        "─────────────",
+        f"*Цена:*  {price} ₸",
+        f"*Город:*  {p.get('city','—')}",
+        f"*Размер:*  {p.get('size','—')}",
+        f"*Свежесть:*  {p.get('fresh','—')}",
+    ]
+    if p.get("count"):
+        lines.append(f"*Цветов:*  {p['count']} шт.")
+    if p.get("occasion"):
+        lines.append(f"*Повод:*  {p['occasion']}")
+    if p.get("desc"):
+        lines.append(f"\n{p['desc']}")
+    lines.append("─────────────")
+    contacts = []
+    if p.get("whatsapp"): contacts.append(f"WhatsApp: {p['whatsapp']}")
+    if p.get("telegram"): contacts.append(f"Telegram: {p['telegram']}")
+    if contacts:
+        lines.append("*Контакты:*  " + " · ".join(contacts))
+    return "\n".join(lines)
+
+
+def _data_url_to_bytes(data_url: str):
+    """Превращает 'data:image/jpeg;base64,...' в bytes для отправки фото."""
+    import base64
+    try:
+        if data_url and data_url.startswith("data:"):
+            b64 = data_url.split(",", 1)[1]
+            return base64.b64decode(b64)
+    except Exception as e:
+        logger.error(f"image decode err: {e}")
+    return None
+
+
+async def fb_check_pending(context: ContextTypes.DEFAULT_TYPE):
+    """Периодически проверяет Firebase на новые заявки (status=pending) и шлёт админу."""
+    if not FIREBASE_OK or not ADMIN_ID:
+        return
+    try:
+        snap = fbdb.reference("products").get()
+    except Exception as e:
+        logger.error(f"fb read err: {e}")
+        return
+    if not snap:
+        return
+    for pid, p in snap.items():
+        if not isinstance(p, dict):
+            continue
+        # шлём только новые заявки на модерации, которые ещё не отправляли
+        if p.get("status") != "pending" or p.get("notified"):
+            continue
+
+        caption = "🆕 *НОВАЯ ЗАЯВКА ИЗ ПРИЛОЖЕНИЯ*\n\n" + fb_format_ad(p)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Одобрить", callback_data=f"fbok:{pid}"),
+            InlineKeyboardButton("Отклонить", callback_data=f"fbno:{pid}"),
+        ]])
+        img = _data_url_to_bytes(p.get("image", ""))
+        try:
+            if img:
+                await context.bot.send_photo(ADMIN_ID, photo=img, caption=caption,
+                                             parse_mode="Markdown", reply_markup=kb)
+            elif p.get("image", "").startswith("http"):
+                await context.bot.send_photo(ADMIN_ID, photo=p["image"], caption=caption,
+                                             parse_mode="Markdown", reply_markup=kb)
+            else:
+                await context.bot.send_message(ADMIN_ID, caption,
+                                               parse_mode="Markdown", reply_markup=kb)
+            # помечаем как отправленную, чтобы не слать повторно
+            fbdb.reference(f"products/{pid}/notified").set(True)
+        except Exception as e:
+            logger.error(f"fb notify err: {e}")
+
+
+async def fb_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Одобрение заявки из приложения: статус→approved + постинг в канал."""
+    q = update.callback_query
+    await q.answer()
+    pid = q.data.split(":", 1)[1]
+    try:
+        p = fbdb.reference(f"products/{pid}").get()
+    except Exception as e:
+        await q.answer("Ошибка доступа к базе", show_alert=True)
+        logger.error(f"fb approve read: {e}")
+        return
+    if not p:
+        await q.edit_message_caption("Заявка не найдена (возможно, уже обработана).")
+        return
+
+    # 1) одобряем в Firebase — товар появится в каталоге приложения
+    try:
+        fbdb.reference(f"products/{pid}/status").set("approved")
+    except Exception as e:
+        await q.answer("Не удалось одобрить", show_alert=True)
+        logger.error(f"fb approve write: {e}")
+        return
+
+    # 2) постим в канал
+    posted = ""
+    if CHANNEL_ID:
+        caption = fb_format_ad(p)
+        # кнопки контактов под постом
+        rows = []
+        wa = "".join(c for c in (p.get("whatsapp") or "") if c.isdigit())
+        if wa:
+            rows.append(InlineKeyboardButton("WhatsApp", url=f"https://wa.me/{wa}"))
+        tg = (p.get("telegram") or "").strip().lstrip("@")
+        if tg and not tg.replace("+", "").isdigit():
+            rows.append(InlineKeyboardButton("Telegram", url=f"https://t.me/{tg}"))
+        kb = InlineKeyboardMarkup([rows]) if rows else None
+        try:
+            img = _data_url_to_bytes(p.get("image", ""))
+            if img:
+                await ctx.bot.send_photo(CHANNEL_ID, photo=img, caption=caption,
+                                         parse_mode="Markdown", reply_markup=kb)
+            elif p.get("image", "").startswith("http"):
+                await ctx.bot.send_photo(CHANNEL_ID, photo=p["image"], caption=caption,
+                                         parse_mode="Markdown", reply_markup=kb)
+            else:
+                await ctx.bot.send_message(CHANNEL_ID, caption,
+                                           parse_mode="Markdown", reply_markup=kb)
+            posted = "\n\n✅ Опубликовано в канале"
+        except Exception as e:
+            posted = f"\n\n⚠️ Одобрено, но не удалось опубликовать: {e}"
+            logger.error(f"fb channel post err: {e}")
+
+    try:
+        await q.edit_message_caption("✅ *ОДОБРЕНО*" + posted, parse_mode="Markdown")
+    except Exception:
+        try: await q.edit_message_text("✅ ОДОБРЕНО" + posted)
+        except Exception: pass
+
+
+async def fb_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Отклонение заявки из приложения: удаляем товар из Firebase."""
+    q = update.callback_query
+    await q.answer()
+    pid = q.data.split(":", 1)[1]
+    try:
+        fbdb.reference(f"products/{pid}").delete()
+    except Exception as e:
+        await q.answer("Не удалось отклонить", show_alert=True)
+        logger.error(f"fb reject err: {e}")
+        return
+    try:
+        await q.edit_message_caption("❌ *ОТКЛОНЕНО*", parse_mode="Markdown")
+    except Exception:
+        try: await q.edit_message_text("❌ ОТКЛОНЕНО")
+        except Exception: pass
+
+
+# ════════════════════════════════════════════════════════════
 def main():
     db_init()   # создаём таблицы при старте
     app = Application.builder().token(TOKEN).build()
@@ -836,8 +1017,16 @@ def main():
     app.add_handler(CallbackQueryHandler(on_moderation, pattern="^(approve|reject)$"))
     app.add_handler(CallbackQueryHandler(on_mark_sold, pattern="^mark_sold$"))
     app.add_handler(CallbackQueryHandler(on_menu, pattern="^how$"))
+    # модерация заявок из веб-приложения (Firebase) — отдельные callback'и
+    app.add_handler(CallbackQueryHandler(fb_approve, pattern="^fbok:"))
+    app.add_handler(CallbackQueryHandler(fb_reject, pattern="^fbno:"))
     # САМЫМ ПОСЛЕДНИМ — ловит «осиротевшие» кнопки после перезапуска бота
     app.add_handler(CallbackQueryHandler(orphan_callback))
+
+    # периодическая проверка новых заявок из приложения (каждые 30 сек)
+    if FIREBASE_OK and app.job_queue:
+        app.job_queue.run_repeating(fb_check_pending, interval=30, first=10)
+        logger.info("✅ Проверка заявок из приложения включена")
 
     logger.info("✅ ReBloomKZ бот запущен!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
