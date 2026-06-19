@@ -91,6 +91,13 @@ CITIES = [
     "Кокшетау", "Туркестан", "Темиртау", "Экибастуз", "Рудный",
 ]
 
+# районы Алматы — показываются вторым шагом, если выбран город Алматы
+ALMATY_DISTRICTS = [
+    "Алмалинский район", "Ауэзовский район", "Бостандыкский район",
+    "Жетысуский район", "Медеуский район", "Наурызбайский район",
+    "Турксибский район", "Алатауский район",
+]
+
 # какие поля карточки обязательны для перехода к оплате
 REQUIRED_FIELDS = ["title", "price", "city", "size", "fresh", "phone"]
 
@@ -484,7 +491,8 @@ async def card_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "price": "Укажите *цену* в тенге:\n_Например: 8000_",
         "phone": "Оставьте *телефон* для связи:\n_Например: +7 707 123 45 67_",
     }
-    await q.message.reply_text(prompts[field], parse_mode="Markdown")
+    sent = await q.message.reply_text(prompts[field], parse_mode="Markdown")
+    ctx.user_data["field_prompt_id"] = sent.message_id
     return WAIT_VAL
 
 
@@ -519,8 +527,44 @@ async def card_set_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     idx = int(q.data.split(":", 1)[1])
-    if 0 <= idx < len(CITIES):
-        ctx.user_data["city"] = CITIES[idx]
+    if not (0 <= idx < len(CITIES)):
+        return CARD
+    city = CITIES[idx]
+
+    # Алматы → второй шаг: выбор района
+    if city == "Алматы":
+        rows = []
+        for i in range(0, len(ALMATY_DISTRICTS), 2):
+            row = [InlineKeyboardButton(ALMATY_DISTRICTS[i], callback_data=f"distr:{i}")]
+            if i + 1 < len(ALMATY_DISTRICTS):
+                row.append(InlineKeyboardButton(ALMATY_DISTRICTS[i + 1], callback_data=f"distr:{i+1}"))
+            rows.append(row)
+        rows.append([InlineKeyboardButton("↩  Назад", callback_data="back_card")])
+        try:
+            await q.message.edit_text("Выберите район Алматы",
+                                      reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            await q.message.reply_text("Выберите район Алматы",
+                                       reply_markup=InlineKeyboardMarkup(rows))
+        return WAIT_VAL
+
+    # остальные города — записываем сразу
+    ctx.user_data["city"] = city
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    await send_card(q.message.chat_id, ctx)
+    return CARD
+
+
+# выбран район Алматы (кнопкой)
+async def card_set_district(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    idx = int(q.data.split(":", 1)[1])
+    if 0 <= idx < len(ALMATY_DISTRICTS):
+        ctx.user_data["city"] = f"Алматы, {ALMATY_DISTRICTS[idx]}"
     try:
         await q.message.delete()
     except Exception:
@@ -553,6 +597,13 @@ async def card_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.delete()
     except Exception:
         pass
+    # удаляем подсказку-вопрос ("Напишите название…" и т.п.)
+    prompt_id = ctx.user_data.pop("field_prompt_id", None)
+    if prompt_id:
+        try:
+            await ctx.bot.delete_message(update.effective_chat.id, prompt_id)
+        except Exception:
+            pass
     await send_card(update.effective_chat.id, ctx)
     return CARD
 
@@ -996,6 +1047,7 @@ def main():
                 CallbackQueryHandler(card_set_size, pattern="^size_"),
                 CallbackQueryHandler(card_set_fresh, pattern="^fr_"),
                 CallbackQueryHandler(card_set_city, pattern="^city:"),
+                CallbackQueryHandler(card_set_district, pattern="^distr:"),
                 CallbackQueryHandler(card_back, pattern="^back_card$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, card_value),
             ],
