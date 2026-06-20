@@ -124,17 +124,20 @@ def db_init():
                 created TIMESTAMP DEFAULT NOW()
             )
         """)
-        # опубликованные объявления (для кнопки "Продано")
+        # опубликованные объявления (для отметки "Продано" в личке с ботом)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS published (
                 channel_msg_id BIGINT PRIMARY KEY,
                 seller_id BIGINT NOT NULL,
                 chat_id BIGINT NOT NULL,
                 is_caption BOOLEAN NOT NULL,
+                title TEXT DEFAULT '',
                 sold BOOLEAN DEFAULT FALSE,
                 created TIMESTAMP DEFAULT NOW()
             )
         """)
+        # на случай, если таблица уже была создана без колонки title — добавим
+        cur.execute("ALTER TABLE published ADD COLUMN IF NOT EXISTS title TEXT DEFAULT ''")
         conn.commit()
         cur.close()
         conn.close()
@@ -171,13 +174,13 @@ def db_del_pending(admin_msg_id):
     except Exception as e:
         logger.error(f"del_pending err: {e}")
 
-def db_save_published(channel_msg_id, seller_id, chat_id, is_caption):
+def db_save_published(channel_msg_id, seller_id, chat_id, is_caption, title=""):
     try:
         conn = db_connect(); cur = conn.cursor()
         cur.execute(
-            "INSERT INTO published (channel_msg_id, seller_id, chat_id, is_caption) "
-            "VALUES (%s, %s, %s, %s) ON CONFLICT (channel_msg_id) DO NOTHING",
-            (channel_msg_id, seller_id, chat_id, is_caption))
+            "INSERT INTO published (channel_msg_id, seller_id, chat_id, is_caption, title) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (channel_msg_id) DO NOTHING",
+            (channel_msg_id, seller_id, chat_id, is_caption, title))
         conn.commit(); cur.close(); conn.close()
     except Exception as e:
         logger.error(f"save_published err: {e}")
@@ -192,6 +195,20 @@ def db_get_published(channel_msg_id):
     except Exception as e:
         logger.error(f"get_published err: {e}")
         return None
+
+def db_get_seller_ads(seller_id):
+    """Непроданные объявления продавца — для отметки 'Продано' в личке."""
+    try:
+        conn = db_connect(); cur = conn.cursor()
+        cur.execute(
+            "SELECT channel_msg_id, title, created FROM published "
+            "WHERE seller_id = %s AND sold = FALSE ORDER BY created DESC",
+            (seller_id,))
+        rows = cur.fetchall(); cur.close(); conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"get_seller_ads err: {e}")
+        return []
 
 def db_mark_sold(channel_msg_id):
     try:
@@ -233,7 +250,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "4.  Оставьте телефон\n"
         + pay_line +
         "─────────────\n"
-        "Когда букет продан — нажмите «Продано» под своим объявлением.\n\n"
+        "Когда букет продан — отправьте команду /sold в этом чате с ботом, "
+        "и отметьте его как проданный.\n\n"
         "/start — начать\n/cancel — отменить",
         parse_mode="Markdown")
 
@@ -254,7 +272,7 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "• Мы проверяем\n"
             "• Объявление публикуется в канале с вашим контактом\n"
             "• Покупатели пишут вам напрямую\n"
-            "• Продали — нажали «Продано», объявление помечается\n"
+            "• Продали — отметили командой /sold, объявление помечается\n"
             "─────────────\n"
             "Нажмите /start, чтобы начать.",
             parse_mode="Markdown")
@@ -786,14 +804,19 @@ async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     chat_id=CHANNEL_ID, photo=photos[0], caption=format_ad(d),
                     parse_mode="Markdown", reply_markup=channel_buttons(d))
                 is_caption = True
-            # сохраняем опубликованное в БАЗУ
-            db_save_published(sent.message_id, d["seller_id"], sent.chat_id, is_caption)
+            # сохраняем опубликованное в БАЗУ (с названием, чтобы показать в /sold)
+            db_save_published(sent.message_id, d["seller_id"], sent.chat_id, is_caption,
+                              d.get("title", ""))
             await q.edit_message_caption(
                 caption=(q.message.caption or "") + "\n\n*ОПУБЛИКОВАНО*", parse_mode="Markdown")
             try:
-                await ctx.bot.send_message(d["seller_id"],
-                    "Ваше объявление одобрено и опубликовано в канале.\n"
-                    "Когда продадите — нажмите «Продано» под объявлением в канале.")
+                await ctx.bot.send_message(
+                    d["seller_id"],
+                    "Ваше объявление одобрено и опубликовано в канале! 🎉\n\n"
+                    "Когда продадите букет — отметьте это командой /sold здесь, в чате с ботом. "
+                    "Я покажу ваши объявления, и вы отметите проданное одним нажатием.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("Мои объявления", callback_data="my_ads")]]))
             except:
                 pass
         except Exception as e:
@@ -824,32 +847,115 @@ def channel_buttons(d, sold=False):
         row.append(InlineKeyboardButton("Telegram", url=f"https://t.me/{d['seller_username']}"))
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("Продано (для продавца)", callback_data="mark_sold")])
+    # Кнопка "Продано" в канале НЕ показывается — продавец отмечает продажу
+    # в личном чате с ботом командой /sold (так её не видят подписчики канала).
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def cmd_sold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Личная команда продавца: показать свои объявления и отметить проданные."""
+    seller_id = update.effective_user.id
+    ads = db_get_seller_ads(seller_id)
+    if not ads:
+        await update.message.reply_text(
+            "У вас нет активных объявлений.\n\n"
+            "Когда ваше объявление одобрят и опубликуют, оно появится здесь — "
+            "и вы сможете отметить его как проданное.")
+        return
+    await update.message.reply_text(
+        "*Ваши активные объявления*\n"
+        "Нажмите на проданный букет, чтобы отметить его как «Продано»:",
+        parse_mode="Markdown",
+        reply_markup=_seller_ads_keyboard(ads))
+
+
+def _seller_ads_keyboard(ads):
+    rows = []
+    for a in ads:
+        title = (a.get("title") or "Объявление").strip()
+        if len(title) > 40:
+            title = title[:38] + "…"
+        date = ""
+        try:
+            date = a["created"].strftime("%d.%m")
+        except Exception:
+            pass
+        label = f"{title}" + (f"  ({date})" if date else "")
+        rows.append([InlineKeyboardButton(
+            label, callback_data=f"sold:{a['channel_msg_id']}")])
     return InlineKeyboardMarkup(rows)
 
 
-async def on_mark_sold(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def on_my_ads(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кнопка 'Мои объявления' — то же, что /sold, но из-под уведомления."""
     q = update.callback_query
-    info = db_get_published(q.message.message_id)   # читаем из БАЗЫ
+    await q.answer()
+    ads = db_get_seller_ads(q.from_user.id)
+    if not ads:
+        await q.message.reply_text(
+            "У вас пока нет активных объявлений для отметки.")
+        return
+    await q.message.reply_text(
+        "*Ваши активные объявления*\n"
+        "Нажмите на проданный букет, чтобы отметить «Продано»:",
+        parse_mode="Markdown",
+        reply_markup=_seller_ads_keyboard(ads))
+
+
+async def on_sold_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Продавец выбрал объявление в личке → помечаем проданным + убираем пост из канала."""
+    q = update.callback_query
+    msg_id = int(q.data.split(":", 1)[1])
+    info = db_get_published(msg_id)
     if not info:
-        await q.answer("Объявление не найдено или уже продано.", show_alert=True)
+        await q.answer("Это объявление уже отмечено или не найдено.", show_alert=True)
+        # обновим список (вдруг устарел)
+        ads = db_get_seller_ads(q.from_user.id)
+        try:
+            if ads:
+                await q.edit_message_reply_markup(reply_markup=_seller_ads_keyboard(ads))
+            else:
+                await q.edit_message_text("Активных объявлений больше нет. Все отмечены как проданные.")
+        except Exception:
+            pass
         return
+    # проверка прав: только владелец (или админ)
     if q.from_user.id != info["seller_id"] and q.from_user.id != ADMIN_ID:
-        await q.answer("Только продавец может отметить «Продано».", show_alert=True)
+        await q.answer("Это не ваше объявление.", show_alert=True)
         return
-    await q.answer("Отмечено как продано")
+
+    await q.answer("Отмечено как продано ✅")
+    db_mark_sold(msg_id)
+
+    # помечаем пост в канале как ПРОДАНО и убираем кнопки контактов
+    if CHANNEL_ID:
+        try:
+            if info["is_caption"]:
+                # пост был фото с подписью — дописываем ПРОДАНО в подпись
+                await ctx.bot.edit_message_caption(
+                    chat_id=CHANNEL_ID, message_id=msg_id,
+                    caption="✅ *ПРОДАНО*", parse_mode="Markdown", reply_markup=None)
+            else:
+                await ctx.bot.edit_message_text(
+                    chat_id=CHANNEL_ID, message_id=msg_id,
+                    text="✅ *ПРОДАНО*", parse_mode="Markdown", reply_markup=None)
+        except Exception as e:
+            logger.error(f"channel mark sold err: {e}")
+
+    # обновляем список объявлений в личке
+    ads = db_get_seller_ads(q.from_user.id)
     try:
-        if info["is_caption"]:
-            await q.edit_message_caption(
-                caption="*ПРОДАНО*\n\n" + (q.message.caption or ""),
-                parse_mode="Markdown", reply_markup=None)
+        if ads:
+            await q.edit_message_text(
+                "Отмечено как проданное ✅\n\n"
+                "*Остальные ваши объявления:*\nНажмите, если что-то ещё продано:",
+                parse_mode="Markdown", reply_markup=_seller_ads_keyboard(ads))
         else:
             await q.edit_message_text(
-                text="*ПРОДАНО*\n\n" + (q.message.text or ""),
-                parse_mode="Markdown", reply_markup=None)
+                "Готово! Отмечено как проданное ✅\n\n"
+                "Активных объявлений больше нет. Спасибо, что продаёте на ReBloomKZ!")
     except Exception as e:
-        logger.error(f"mark sold err: {e}")
-    db_mark_sold(q.message.message_id)
+        logger.error(f"update seller list err: {e}")
 
 
 # Страховка: если бот перезапустился (Railway сбросил состояние в памяти),
@@ -1064,10 +1170,13 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("sold", cmd_sold))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(send_to_moderation, pattern="^send_mod$"))
     app.add_handler(CallbackQueryHandler(on_moderation, pattern="^(approve|reject)$"))
-    app.add_handler(CallbackQueryHandler(on_mark_sold, pattern="^mark_sold$"))
+    # отметка "Продано" в личке с ботом (вместо кнопки в канале)
+    app.add_handler(CallbackQueryHandler(on_my_ads, pattern="^my_ads$"))
+    app.add_handler(CallbackQueryHandler(on_sold_pick, pattern="^sold:"))
     app.add_handler(CallbackQueryHandler(on_menu, pattern="^how$"))
     # модерация заявок из веб-приложения (Firebase) — отдельные callback'и
     app.add_handler(CallbackQueryHandler(fb_approve, pattern="^fbok:"))
