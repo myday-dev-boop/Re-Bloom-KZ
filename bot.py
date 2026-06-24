@@ -10,7 +10,7 @@ from datetime import datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -62,7 +62,32 @@ PAY_NAME   = "Meiramkul"
 #   WAIT_VAL — ждём текстовый ввод значения выбранного поля
 #   PAYMENT  — приём чека об оплате
 PHOTOS, CARD, WAIT_VAL, PAYMENT = range(4)
-MAX_PHOTOS = 5
+MAX_PHOTOS = 5   # общий лимит файлов (фото + видео)
+
+
+def get_media(d: dict):
+    """
+    Возвращает список медиа в едином формате: [{"type": "photo"|"video", "id": file_id}, ...]
+    Поддерживает старый формат, где d["photos"] — это просто список file_id строк.
+    """
+    media = d.get("media")
+    if media:
+        # уже новый формат
+        return [m for m in media if isinstance(m, dict) and m.get("id")]
+    # старый формат: photos = [file_id, file_id, ...] — считаем их фото
+    return [{"type": "photo", "id": fid} for fid in d.get("photos", []) if fid]
+
+
+def build_album(media, caption=None, parse_mode="Markdown"):
+    """Собирает список InputMedia* для send_media_group. Подпись — на первый элемент."""
+    out = []
+    for i, m in enumerate(media):
+        cap = caption if i == 0 else None
+        if m["type"] == "video":
+            out.append(InputMediaVideo(m["id"], caption=cap, parse_mode=parse_mode))
+        else:
+            out.append(InputMediaPhoto(m["id"], caption=cap, parse_mode=parse_mode))
+    return out
 
 # справочник размеров: код кнопки -> текст (как на скрине)
 SIZES = {
@@ -244,8 +269,8 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*Как подать объявление*\n"
         "─────────────\n"
-        "1.  Сфотографируйте букет с подписью «ReBloomKZ» и датой\n"
-        "2.  При желании добавьте ещё фото (до 5)\n"
+        "1.  Сфотографируйте или снимите букет с подписью «ReBloomKZ» и датой\n"
+        f"2.  При желании добавьте ещё фото или видео (всего до {MAX_PHOTOS})\n"
         "3.  Заполните название, цену, город, размер, свежесть\n"
         "4.  Оставьте телефон\n"
         + pay_line +
@@ -265,7 +290,7 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(
             "*Как всё устроено*\n"
             "─────────────\n"
-            "• Вы фотографируете букет с подписью на бумаге «ReBloomKZ» и датой "
+            "• Вы фотографируете или снимаете букет с подписью на бумаге «ReBloomKZ» и датой "
             "(защита от обмана — подтверждает, что букет реальный и у вас на руках)\n"
             "• Заполняете анкету\n"
             + pay_line +
@@ -288,17 +313,17 @@ async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════════════════════
 async def ad_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
-    ctx.user_data["photos"] = []
+    ctx.user_data["media"] = []
     today = datetime.now().strftime("%d.%m.%Y")
     text = (
-        "*Фото букета*\n"
+        "*Фото и видео букета*\n"
         "─────────────\n"
         "Для защиты от обмана положите рядом с букетом листок с надписью "
         f"*«ReBloomKZ»* и сегодняшней датой (_{today}_) и сфотографируйте букет "
         "вместе с этой подписью.\n\n"
         "Так покупатели будут уверены, что букет настоящий и у вас на руках.\n\n"
-        "Отправьте фото (можно несколько, до 5). Кнопка «Готово» появится "
-        "после первого фото."
+        f"Отправьте фото и/или видео (всего до {MAX_PHOTOS}). Кнопка «Готово» появится "
+        "после первого файла."
     )
     if update.callback_query:
         await update.callback_query.answer()
@@ -310,29 +335,46 @@ async def ad_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def ad_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.message.photo:
-        await update.message.reply_text("Пожалуйста, отправьте фото (или нажмите «Готово с фото»)")
+    msg = update.message
+    # определяем тип присланного файла
+    new_item = None
+    if msg.photo:
+        new_item = {"type": "photo", "id": msg.photo[-1].file_id}
+    elif msg.video:
+        new_item = {"type": "video", "id": msg.video.file_id}
+    elif msg.document and (msg.document.mime_type or "").startswith("video"):
+        # видео, присланное файлом
+        new_item = {"type": "video", "id": msg.document.file_id}
+    else:
+        await msg.reply_text("Пожалуйста, отправьте фото или видео (или нажмите «Готово»)")
         return PHOTOS
 
-    photos = ctx.user_data.setdefault("photos", [])
-    if len(photos) >= MAX_PHOTOS:
+    media = ctx.user_data.setdefault("media", [])
+    if len(media) >= MAX_PHOTOS:
         if not ctx.user_data.get("_warned_max"):
             ctx.user_data["_warned_max"] = True
-            await update.message.reply_text(
-                f"Можно максимум {MAX_PHOTOS} фото — лишние не добавлены. Нажмите «Готово с фото».")
+            await msg.reply_text(
+                f"Можно максимум {MAX_PHOTOS} файлов — лишние не добавлены. Нажмите «Готово».")
         return PHOTOS
 
-    photos.append(update.message.photo[-1].file_id)
-    count = len(photos)
+    media.append(new_item)
+    count = len(media)
     left = MAX_PHOTOS - count
     chat_id = update.effective_chat.id
 
-    text = (f"Фото добавлено ({count}/{MAX_PHOTOS}).\n"
+    n_photo = sum(1 for m in media if m["type"] == "photo")
+    n_video = sum(1 for m in media if m["type"] == "video")
+    parts = []
+    if n_photo: parts.append(f"фото: {n_photo}")
+    if n_video: parts.append(f"видео: {n_video}")
+    summary = ", ".join(parts)
+
+    text = (f"Добавлено ({count}/{MAX_PHOTOS}) — {summary}.\n"
             + (f"Можно ещё {left}, или нажмите «Готово»." if left else "Это максимум. Нажмите «Готово»."))
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Готово с фото", callback_data="photos_done")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Готово", callback_data="photos_done")]])
 
     # Если подсказка уже есть — просто обновляем счётчик в ней (важно для альбомов:
-    # 4 фото из одного альбома обновят одно сообщение, а не создадут 4 дубля кнопки).
+    # несколько файлов из одного альбома обновят одно сообщение, а не создадут дубли кнопки).
     prompt_id = ctx.user_data.get("photo_prompt_id")
     if prompt_id:
         try:
@@ -351,11 +393,11 @@ async def ad_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def photos_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if not ctx.user_data.get("photos"):
-        await q.answer("Сначала отправьте хотя бы одно фото", show_alert=True)
+    if not ctx.user_data.get("media"):
+        await q.answer("Сначала отправьте хотя бы одно фото или видео", show_alert=True)
         return PHOTOS
     # ВРЕМЕННАЯ ДИАГНОСТИКА
-    n = len(ctx.user_data.get("photos", []))
+    n = len(ctx.user_data.get("media", []))
     logger.info(f"PHOTOS_DONE: collected = {n}")
     # убираем подсказку с кнопкой
     try:
@@ -381,8 +423,13 @@ def card_text(d: dict) -> str:
         return d.get(key) or default
     price = d.get("price")
     price_line = f"{price} ₸" if price else "—"
-    n_photos = len(d.get("photos", []))
-    photo_line = f"*Фото:*  {n_photos} шт." if n_photos else "*Фото:*  —"
+    media = get_media(d)
+    n_photo = sum(1 for m in media if m["type"] == "photo")
+    n_video = sum(1 for m in media if m["type"] == "video")
+    parts = []
+    if n_photo: parts.append(f"фото {n_photo}")
+    if n_video: parts.append(f"видео {n_video}")
+    photo_line = f"*Медиа:*  {', '.join(parts)}" if parts else "*Медиа:*  —"
     return (
         "*Объявление*\n"
         "─────────────\n"
@@ -394,7 +441,7 @@ def card_text(d: dict) -> str:
         f"*Свежесть:*  {v('fresh', '—')}\n"
         f"*Телефон:*  {v('phone', '—')}\n"
         "─────────────\n"
-        "_В объявлении покажутся все фото. Нажмите на поле ниже, чтобы заполнить его._"
+        "_В объявлении покажутся все фото и видео. Нажмите на поле ниже, чтобы заполнить его._"
     )
 
 
@@ -416,7 +463,7 @@ def card_keyboard(d: dict) -> InlineKeyboardMarkup:
          InlineKeyboardButton(mark("size", "Размер"),   callback_data="f:size")],
         [InlineKeyboardButton(mark("fresh", "Свежесть"), callback_data="f:fresh"),
          InlineKeyboardButton(mark("phone", "Телефон"),  callback_data="f:phone")],
-        [InlineKeyboardButton("Изменить фото", callback_data="f:photos")],
+        [InlineKeyboardButton("Изменить фото/видео", callback_data="f:photos")],
         [InlineKeyboardButton("Отменить", callback_data="cancel_ad"), bottom],
     ])
 
@@ -434,13 +481,24 @@ async def send_card(chat_id, ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.bot.delete_message(chat_id, old_id)
         except Exception:
             pass
-    sent = await ctx.bot.send_photo(
-        chat_id=chat_id,
-        photo=d["photos"][0],
-        caption=card_text(d),
-        parse_mode="Markdown",
-        reply_markup=card_keyboard(d),
-    )
+    media = get_media(d)
+    first = media[0]
+    if first["type"] == "video":
+        sent = await ctx.bot.send_video(
+            chat_id=chat_id,
+            video=first["id"],
+            caption=card_text(d),
+            parse_mode="Markdown",
+            reply_markup=card_keyboard(d),
+        )
+    else:
+        sent = await ctx.bot.send_photo(
+            chat_id=chat_id,
+            photo=first["id"],
+            caption=card_text(d),
+            parse_mode="Markdown",
+            reply_markup=card_keyboard(d),
+        )
     d["card_msg_id"] = sent.message_id
 
 
@@ -462,14 +520,15 @@ async def card_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["editing_field"] = field
 
     if field == "photos":
-        # вернуться к добавлению фото заново — сбрасываем счётчик и флаги
-        ctx.user_data["photos"] = []
+        # вернуться к добавлению медиа заново — сбрасываем счётчик и флаги
+        ctx.user_data["media"] = []
         ctx.user_data.pop("photo_prompt_id", None)
         ctx.user_data.pop("_warned_max", None)
         await q.message.reply_text(
-            "Пришлите новое фото (можно до 5). Когда закончите — нажмите «Готово с фото».",
+            f"Пришлите новые фото и/или видео (всего до {MAX_PHOTOS}). "
+            "Когда закончите — нажмите «Готово».",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Готово с фото", callback_data="photos_done")]]))
+                [[InlineKeyboardButton("Готово", callback_data="photos_done")]]))
         return PHOTOS
 
     # ── РАЗМЕР — список кнопок ──
@@ -646,7 +705,7 @@ async def card_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # ── ОПЛАТА ВКЛЮЧЕНА: показываем реквизиты и ждём чек ──
     await ctx.bot.send_message(
         q.message.chat_id,
-        f"Так будет выглядеть объявление ({len(d['photos'])} фото).\n\n"
+        f"Так будет выглядеть объявление ({len(get_media(d))} файлов).\n\n"
         "─────────────\n"
         "*Оплата публикации*\n\n"
         f"Стоимость размещения — *{PAY_AMOUNT} ₸*.\n\n"
@@ -719,30 +778,35 @@ async def _submit_to_moderation(chat_id, ctx: ContextTypes.DEFAULT_TYPE):
     if not ADMIN_ID:
         await ctx.bot.send_message(chat_id, "Модератор не настроен.")
         return
-    photos = d["photos"]
+    media_items = get_media(d)
     caption = "🆕 *НА ПРОВЕРКУ*\n\n" + format_ad(d)
     mod_kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Одобрить", callback_data="approve"),
          InlineKeyboardButton("Отклонить", callback_data="reject")],
     ])
-    if len(photos) > 1:
-        # все фото + текст одним альбомом (подпись на первом фото).
+    if len(media_items) > 1:
+        # все фото/видео + текст одним альбомом (подпись на первом файле).
         # Кнопки к альбому прикрепить нельзя — шлём их отдельным коротким
         # сообщением, и именно его message_id сохраняем как ключ заявки
         # (на нём же висят кнопки Одобрить/Отклонить).
-        media = [InputMediaPhoto(photos[0], caption=caption, parse_mode="Markdown")]
-        media += [InputMediaPhoto(p) for p in photos[1:]]
+        album = build_album(media_items, caption=caption)
         try:
-            await ctx.bot.send_media_group(chat_id=ADMIN_ID, media=media)
+            await ctx.bot.send_media_group(chat_id=ADMIN_ID, media=album)
         except Exception as e:
             logger.error(f"media_group err: {e}")
         sent = await ctx.bot.send_message(
             chat_id=ADMIN_ID, text="Решение по объявлению выше:",
             reply_markup=mod_kb)
     else:
-        sent = await ctx.bot.send_photo(
-            chat_id=ADMIN_ID, photo=photos[0], caption=caption,
-            parse_mode="Markdown", reply_markup=mod_kb)
+        first = media_items[0]
+        if first["type"] == "video":
+            sent = await ctx.bot.send_video(
+                chat_id=ADMIN_ID, video=first["id"], caption=caption,
+                parse_mode="Markdown", reply_markup=mod_kb)
+        else:
+            sent = await ctx.bot.send_photo(
+                chat_id=ADMIN_ID, photo=first["id"], caption=caption,
+                parse_mode="Markdown", reply_markup=mod_kb)
     # сохраняем заявку в БАЗУ (а не в память!)
     db_save_pending(sent.message_id, d)
     # чек об оплате — только когда оплата включена
@@ -820,21 +884,26 @@ async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("CHANNEL_ID не настроен!")
             return
         try:
-            photos = d["photos"]
-            # ВРЕМЕННАЯ ДИАГНОСТИКА: показываем, сколько фото реально дошло до публикации
-            logger.info(f"PUBLISH: photos count = {len(photos)} | ids = {photos}")
-            await q.message.reply_text(f"Публикую фото: {len(photos)} шт.")
+            media_items = get_media(d)
+            # ВРЕМЕННАЯ ДИАГНОСТИКА
+            logger.info(f"PUBLISH: media count = {len(media_items)} | {media_items}")
+            await q.message.reply_text(f"Публикую: {len(media_items)} файлов.")
             caption = format_ad(d)
-            if len(photos) > 1:
-                # всё одним альбомом: подпись на первом фото, контакты — ссылками в тексте
-                media = [InputMediaPhoto(photos[0], caption=caption, parse_mode="Markdown")]
-                media += [InputMediaPhoto(p) for p in photos[1:]]
-                sent_group = await ctx.bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+            if len(media_items) > 1:
+                # всё одним альбомом: подпись на первом файле, контакты — ссылками в тексте
+                album = build_album(media_items, caption=caption)
+                sent_group = await ctx.bot.send_media_group(chat_id=CHANNEL_ID, media=album)
                 sent = sent_group[0]
             else:
-                sent = await ctx.bot.send_photo(
-                    chat_id=CHANNEL_ID, photo=photos[0], caption=caption,
-                    parse_mode="Markdown")
+                first = media_items[0]
+                if first["type"] == "video":
+                    sent = await ctx.bot.send_video(
+                        chat_id=CHANNEL_ID, video=first["id"], caption=caption,
+                        parse_mode="Markdown")
+                else:
+                    sent = await ctx.bot.send_photo(
+                        chat_id=CHANNEL_ID, photo=first["id"], caption=caption,
+                        parse_mode="Markdown")
             is_caption = True
             # сохраняем опубликованное в БАЗУ (с названием, чтобы показать в /sold)
             db_save_published(sent.message_id, d["seller_id"], sent.chat_id, is_caption,
@@ -1196,7 +1265,7 @@ def main():
         entry_points=[CallbackQueryHandler(ad_start, pattern="^new_ad$")],
         states={
             PHOTOS: [
-                MessageHandler(filters.PHOTO, ad_photo),
+                MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.VIDEO, ad_photo),
                 CallbackQueryHandler(photos_done, pattern="^photos_done$"),
             ],
             CARD: [
