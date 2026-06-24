@@ -720,18 +720,29 @@ async def _submit_to_moderation(chat_id, ctx: ContextTypes.DEFAULT_TYPE):
         await ctx.bot.send_message(chat_id, "Модератор не настроен.")
         return
     photos = d["photos"]
+    caption = "🆕 *НА ПРОВЕРКУ*\n\n" + format_ad(d)
+    mod_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Одобрить", callback_data="approve"),
+         InlineKeyboardButton("Отклонить", callback_data="reject")],
+    ])
     if len(photos) > 1:
+        # все фото + текст одним альбомом (подпись на первом фото).
+        # Кнопки к альбому прикрепить нельзя — шлём их отдельным коротким
+        # сообщением, и именно его message_id сохраняем как ключ заявки
+        # (на нём же висят кнопки Одобрить/Отклонить).
+        media = [InputMediaPhoto(photos[0], caption=caption, parse_mode="Markdown")]
+        media += [InputMediaPhoto(p) for p in photos[1:]]
         try:
-            await ctx.bot.send_media_group(chat_id=ADMIN_ID, media=[InputMediaPhoto(p) for p in photos])
+            await ctx.bot.send_media_group(chat_id=ADMIN_ID, media=media)
         except Exception as e:
             logger.error(f"media_group err: {e}")
-    caption = "🆕 *НА ПРОВЕРКУ*\n\n" + format_ad(d)
-    sent = await ctx.bot.send_photo(
-        chat_id=ADMIN_ID, photo=photos[0], caption=caption, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Одобрить", callback_data="approve"),
-             InlineKeyboardButton("Отклонить", callback_data="reject")],
-        ]))
+        sent = await ctx.bot.send_message(
+            chat_id=ADMIN_ID, text="Решение по объявлению выше:",
+            reply_markup=mod_kb)
+    else:
+        sent = await ctx.bot.send_photo(
+            chat_id=ADMIN_ID, photo=photos[0], caption=caption,
+            parse_mode="Markdown", reply_markup=mod_kb)
     # сохраняем заявку в БАЗУ (а не в память!)
     db_save_pending(sent.message_id, d)
     # чек об оплате — только когда оплата включена
@@ -781,14 +792,27 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════════════════════
 #                    МОДЕРАЦИЯ
 # ════════════════════════════════════════════════════════════
+async def _edit_mod_status(q, suffix):
+    """Дописывает статус к карточке заявки. Работает и для фото-с-подписью
+    (одно фото), и для текстового сообщения с кнопками (альбом)."""
+    base = q.message.caption if q.message.caption is not None else (q.message.text or "")
+    new_text = base + suffix
+    try:
+        await q.edit_message_caption(caption=new_text, parse_mode="Markdown")
+    except Exception:
+        try:
+            await q.edit_message_text(text=new_text, parse_mode="Markdown")
+        except Exception:
+            pass
+
+
 async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     msg_id = q.message.message_id
     d = db_get_pending(msg_id)        # читаем из БАЗЫ
     if not d:
-        await q.edit_message_caption(
-            caption=(q.message.caption or "") + "\n\nДанные устарели.", parse_mode="Markdown")
+        await _edit_mod_status(q, "\n\nДанные устарели.")
         return
 
     if q.data == "approve":
@@ -815,8 +839,7 @@ async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # сохраняем опубликованное в БАЗУ (с названием, чтобы показать в /sold)
             db_save_published(sent.message_id, d["seller_id"], sent.chat_id, is_caption,
                               d.get("title", ""))
-            await q.edit_message_caption(
-                caption=(q.message.caption or "") + "\n\n*ОПУБЛИКОВАНО*", parse_mode="Markdown")
+            await _edit_mod_status(q, "\n\n*ОПУБЛИКОВАНО*")
             try:
                 await ctx.bot.send_message(
                     d["seller_id"],
@@ -831,8 +854,7 @@ async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logger.error(f"publish err: {e}")
             await q.message.reply_text(f"Ошибка публикации: {e}")
     elif q.data == "reject":
-        await q.edit_message_caption(
-            caption=(q.message.caption or "") + "\n\n*ОТКЛОНЕНО*", parse_mode="Markdown")
+        await _edit_mod_status(q, "\n\n*ОТКЛОНЕНО*")
         try:
             await ctx.bot.send_message(d["seller_id"],
                 "К сожалению, объявление не прошло проверку.\n"
