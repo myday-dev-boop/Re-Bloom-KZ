@@ -701,8 +701,15 @@ def format_ad(d):
         txt += f"*Свежесть:*  {d['fresh']}\n"
     txt += "─────────────\n"
     txt += f"*Связь:*  {d['phone']}"
+    # контакты ссылками (вместо кнопок — чтобы влезли в подпись альбома)
+    contacts = []
+    phone_digits = "".join(c for c in d["phone"] if c.isdigit())
+    if phone_digits:
+        contacts.append(f"[WhatsApp](https://wa.me/{phone_digits})")
     if d.get("seller_username"):
-        txt += f"\n*Telegram:*  @{d['seller_username']}"
+        contacts.append(f"[Telegram](https://t.me/{d['seller_username']})")
+    if contacts:
+        txt += "\n*Написать:*  " + "  ·  ".join(contacts)
     return txt
 
 
@@ -793,17 +800,18 @@ async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             # ВРЕМЕННАЯ ДИАГНОСТИКА: показываем, сколько фото реально дошло до публикации
             logger.info(f"PUBLISH: photos count = {len(photos)} | ids = {photos}")
             await q.message.reply_text(f"Публикую фото: {len(photos)} шт.")
+            caption = format_ad(d)
             if len(photos) > 1:
-                await ctx.bot.send_media_group(chat_id=CHANNEL_ID, media=[InputMediaPhoto(p) for p in photos])
-                sent = await ctx.bot.send_message(
-                    chat_id=CHANNEL_ID, text=format_ad(d), parse_mode="Markdown",
-                    reply_markup=channel_buttons(d))
-                is_caption = False
+                # всё одним альбомом: подпись на первом фото, контакты — ссылками в тексте
+                media = [InputMediaPhoto(photos[0], caption=caption, parse_mode="Markdown")]
+                media += [InputMediaPhoto(p) for p in photos[1:]]
+                sent_group = await ctx.bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+                sent = sent_group[0]
             else:
                 sent = await ctx.bot.send_photo(
-                    chat_id=CHANNEL_ID, photo=photos[0], caption=format_ad(d),
-                    parse_mode="Markdown", reply_markup=channel_buttons(d))
-                is_caption = True
+                    chat_id=CHANNEL_ID, photo=photos[0], caption=caption,
+                    parse_mode="Markdown")
+            is_caption = True
             # сохраняем опубликованное в БАЗУ (с названием, чтобы показать в /sold)
             db_save_published(sent.message_id, d["seller_id"], sent.chat_id, is_caption,
                               d.get("title", ""))
@@ -1003,6 +1011,40 @@ def fb_format_ad(p: dict) -> str:
     return "\n".join(lines)
 
 
+def fb_format_ad_channel(p: dict) -> str:
+    """Текст карточки заявки из приложения для канала — с кликабельными контактами."""
+    price = p.get("price", 0)
+    try:
+        price = f"{int(price):,}".replace(",", " ")
+    except Exception:
+        pass
+    lines = [
+        f"*{p.get('name','Без названия')}*",
+        "─────────────",
+        f"*Цена:*  {price} ₸",
+        f"*Город:*  {p.get('city','—')}",
+        f"*Размер:*  {p.get('size','—')}",
+        f"*Свежесть:*  {p.get('fresh','—')}",
+    ]
+    if p.get("count"):
+        lines.append(f"*Цветов:*  {p['count']} шт.")
+    if p.get("occasion"):
+        lines.append(f"*Повод:*  {p['occasion']}")
+    if p.get("desc"):
+        lines.append(f"\n{p['desc']}")
+    lines.append("─────────────")
+    contacts = []
+    wa = "".join(c for c in (p.get("whatsapp") or "") if c.isdigit())
+    if wa:
+        contacts.append(f"[WhatsApp](https://wa.me/{wa})")
+    tg = (p.get("telegram") or "").strip().lstrip("@")
+    if tg and not tg.replace("+", "").isdigit():
+        contacts.append(f"[Telegram](https://t.me/{tg})")
+    if contacts:
+        lines.append("*Написать:*  " + "  ·  ".join(contacts))
+    return "\n".join(lines)
+
+
 def _data_url_to_bytes(data_url: str):
     """Превращает 'data:image/jpeg;base64,...' в bytes для отправки фото."""
     import base64
@@ -1078,30 +1120,21 @@ async def fb_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logger.error(f"fb approve write: {e}")
         return
 
-    # 2) постим в канал
+    # 2) постим в канал — контакты ссылками прямо в тексте (без кнопок)
     posted = ""
     if CHANNEL_ID:
-        caption = fb_format_ad(p)
-        # кнопки контактов под постом
-        rows = []
-        wa = "".join(c for c in (p.get("whatsapp") or "") if c.isdigit())
-        if wa:
-            rows.append(InlineKeyboardButton("WhatsApp", url=f"https://wa.me/{wa}"))
-        tg = (p.get("telegram") or "").strip().lstrip("@")
-        if tg and not tg.replace("+", "").isdigit():
-            rows.append(InlineKeyboardButton("Telegram", url=f"https://t.me/{tg}"))
-        kb = InlineKeyboardMarkup([rows]) if rows else None
+        caption = fb_format_ad_channel(p)
         try:
             img = _data_url_to_bytes(p.get("image", ""))
             if img:
                 await ctx.bot.send_photo(CHANNEL_ID, photo=img, caption=caption,
-                                         parse_mode="Markdown", reply_markup=kb)
+                                         parse_mode="Markdown")
             elif p.get("image", "").startswith("http"):
                 await ctx.bot.send_photo(CHANNEL_ID, photo=p["image"], caption=caption,
-                                         parse_mode="Markdown", reply_markup=kb)
+                                         parse_mode="Markdown")
             else:
                 await ctx.bot.send_message(CHANNEL_ID, caption,
-                                           parse_mode="Markdown", reply_markup=kb)
+                                           parse_mode="Markdown")
             posted = "\n\n✅ Опубликовано в канале"
         except Exception as e:
             posted = f"\n\n⚠️ Одобрено, но не удалось опубликовать: {e}"
