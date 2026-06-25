@@ -28,6 +28,9 @@ TOKEN      = os.environ["TELEGRAM_TOKEN"]
 ADMIN_ID   = int(os.environ.get("ADMIN_ID", "0"))
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "")
 DB_URL     = os.environ.get("DATABASE_URL", "")
+# username бота без @ — нужен для кнопки "Поддержка" под постами канала.
+# Например: ReBloomBot
+BOT_USERNAME = os.environ.get("BOT_USERNAME", "").lstrip("@")
 
 # ── Firebase: ключ из переменной окружения FIREBASE_CREDENTIALS (JSON-строка) ──
 FIREBASE_DB_URL = "https://rebloomkz-97ca0-default-rtdb.europe-west1.firebasedatabase.app"
@@ -248,10 +251,18 @@ def db_mark_sold(channel_msg_id):
 #                    КОМАНДЫ
 # ════════════════════════════════════════════════════════════
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # deep-link: /start support → сразу открыть режим поддержки
+    # (кнопка под постами канала ведёт на https://t.me/<бот>?start=support)
+    if ctx.args and ctx.args[0] == "support":
+        ctx.user_data["support_mode"] = True
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("Отменить", callback_data="support_cancel")]])
+        await update.message.reply_text(SUPPORT_PROMPT, parse_mode="Markdown", reply_markup=kb)
+        return
     name = update.effective_user.first_name or "друг"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Подать объявление", callback_data="new_ad")],
         [InlineKeyboardButton("Как это работает", callback_data="how")],
+        [InlineKeyboardButton("✉️ Связаться с поддержкой", callback_data="support_start")],
     ])
     await update.message.reply_text(
         f"Здравствуйте, {name}.\n\n"
@@ -277,7 +288,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "─────────────\n"
         "Когда букет продан — отправьте команду /sold в этом чате с ботом, "
         "и отметьте его как проданный.\n\n"
-        "/start — начать\n/cancel — отменить",
+        "/start — начать\n/support — связаться с поддержкой\n/cancel — отменить",
         parse_mode="Markdown")
 
 
@@ -306,6 +317,107 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Ваш Telegram ID: `{update.effective_user.id}`", parse_mode="Markdown")
+
+
+# ════════════════════════════════════════════════════════════
+#                    ПОДДЕРЖКА (связь с админом через бота)
+# ════════════════════════════════════════════════════════════
+# Пользователь пишет /support (или жмёт кнопку) → включается режим поддержки.
+# Следующее его сообщение пересылается админу. Админ отвечает командой
+# /reply <id> <текст> — ответ уходит пользователю. Личный аккаунт админа скрыт.
+
+SUPPORT_PROMPT = (
+    "✉️ *Связь с поддержкой ReBloomKZ*\n"
+    "─────────────\n"
+    "Напишите ваш вопрос одним сообщением — оно уйдёт администратору. "
+    "Можно приложить фото.\n\n"
+    "Ответ придёт сюда, в этот чат."
+)
+
+
+async def cmd_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда /support — включает режим написания админу."""
+    ctx.user_data["support_mode"] = True
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Отменить", callback_data="support_cancel")]])
+    await update.message.reply_text(SUPPORT_PROMPT, parse_mode="Markdown", reply_markup=kb)
+
+
+async def support_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кнопка 'Связаться с поддержкой' из меню /start."""
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data["support_mode"] = True
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Отменить", callback_data="support_cancel")]])
+    await q.message.reply_text(SUPPORT_PROMPT, parse_mode="Markdown", reply_markup=kb)
+
+
+async def support_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    ctx.user_data.pop("support_mode", None)
+    try:
+        await q.edit_message_text("Окей, отменено. /start — вернуться в меню.")
+    except Exception:
+        await q.message.reply_text("Окей, отменено. /start — вернуться в меню.")
+
+
+async def support_relay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Пересылает сообщение пользователя админу, если включён режим поддержки."""
+    if not ctx.user_data.get("support_mode"):
+        return  # пользователь не в режиме поддержки — игнорируем
+    if not ADMIN_ID:
+        await update.message.reply_text("Поддержка временно недоступна.")
+        ctx.user_data.pop("support_mode", None)
+        return
+    u = update.effective_user
+    uname = f"@{u.username}" if u.username else "(без username)"
+    header = (f"📨 *Вопрос в поддержку*\n"
+              f"От: {u.first_name or 'Пользователь'} {uname}\n"
+              f"ID: `{u.id}`\n"
+              "─────────────")
+    try:
+        await ctx.bot.send_message(ADMIN_ID, header, parse_mode="Markdown")
+        # пересылаем само сообщение как есть (текст/фото сохраняются)
+        await ctx.bot.forward_message(
+            chat_id=ADMIN_ID, from_chat_id=u.id, message_id=update.message.message_id)
+        # подсказка админу, как ответить
+        await ctx.bot.send_message(
+            ADMIN_ID,
+            f"_Чтобы ответить — отправьте:_\n`/reply {u.id} ваш текст`",
+            parse_mode="Markdown")
+        await update.message.reply_text(
+            "✅ Сообщение отправлено администратору. Ответ придёт сюда.")
+    except Exception as e:
+        logger.error(f"support relay err: {e}")
+        await update.message.reply_text("Не удалось отправить сообщение. Попробуйте позже.")
+    finally:
+        ctx.user_data.pop("support_mode", None)
+
+
+async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда админа: /reply <user_id> <текст> — отправить ответ пользователю."""
+    if update.effective_user.id != ADMIN_ID:
+        return  # только админ
+    parts = (update.message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await update.message.reply_text("Формат: `/reply <id> <текст ответа>`",
+                                        parse_mode="Markdown")
+        return
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.\nФормат: `/reply <id> <текст>`",
+                                        parse_mode="Markdown")
+        return
+    answer = parts[2]
+    try:
+        await ctx.bot.send_message(
+            target_id,
+            "💬 *Ответ от поддержки ReBloomKZ:*\n─────────────\n" + answer,
+            parse_mode="Markdown")
+        await update.message.reply_text("✅ Ответ отправлен.")
+    except Exception as e:
+        await update.message.reply_text(f"Не удалось отправить: {e}")
 
 
 # ════════════════════════════════════════════════════════════
@@ -769,6 +881,9 @@ def format_ad(d):
         contacts.append(f"[Telegram](https://t.me/{d['seller_username']})")
     if contacts:
         txt += "\n*Написать:*  " + "  ·  ".join(contacts)
+    # ссылка на поддержку под каждым постом канала (deep-link открывает чат с ботом)
+    if BOT_USERNAME:
+        txt += f"\n\n_Вопрос администратору:_ [написать в поддержку](https://t.me/{BOT_USERNAME}?start=support)"
     return txt
 
 
@@ -1295,6 +1410,11 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("id", cmd_id))
     app.add_handler(CommandHandler("sold", cmd_sold))
+    # поддержка: команды для пользователя и админа
+    app.add_handler(CommandHandler("support", cmd_support))
+    app.add_handler(CommandHandler("reply", cmd_reply))
+    app.add_handler(CallbackQueryHandler(support_start, pattern="^support_start$"))
+    app.add_handler(CallbackQueryHandler(support_cancel, pattern="^support_cancel$"))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(send_to_moderation, pattern="^send_mod$"))
     app.add_handler(CallbackQueryHandler(on_moderation, pattern="^(approve|reject)$"))
@@ -1307,6 +1427,11 @@ def main():
     app.add_handler(CallbackQueryHandler(fb_reject, pattern="^fbno:"))
     # САМЫМ ПОСЛЕДНИМ — ловит «осиротевшие» кнопки после перезапуска бота
     app.add_handler(CallbackQueryHandler(orphan_callback))
+
+    # пересылка сообщений в поддержку — отдельная группа (group=1), чтобы не
+    # конфликтовать с анкетой. Срабатывает только при включённом support_mode.
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO) & ~filters.COMMAND, support_relay), group=1)
 
     # периодическая проверка новых заявок из приложения (каждые 30 сек)
     if FIREBASE_OK and app.job_queue:
