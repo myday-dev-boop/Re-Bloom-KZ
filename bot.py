@@ -307,6 +307,15 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("Отменить", callback_data="support_cancel")]])
         await update.message.reply_text(SUPPORT_PROMPT, parse_mode="Markdown", reply_markup=kb)
         return
+    # deep-link: /start buy_<channel_msg_id> → показать заявку на покупку
+    if ctx.args and ctx.args[0].startswith("buy_"):
+        try:
+            ad_id = int(ctx.args[0].split("_", 1)[1])
+        except (ValueError, IndexError):
+            ad_id = None
+        if ad_id:
+            await show_buy_request(update, ctx, ad_id)
+            return
     name = update.effective_user.first_name or "друг"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Подать объявление", callback_data="new_ad")],
@@ -471,6 +480,143 @@ async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ════════════════════════════════════════════════════════════
+#                    ЗАЯВКА НА ПОКУПКУ
+# ════════════════════════════════════════════════════════════
+# Покупатель жмёт «Заявка на покупку» под постом → попадает к боту по deep-link.
+# Бот показывает данные букета + предупреждение о безопасности + кнопку
+# «Хочу купить букет». По нажатию покупателю приходит контакт продавца,
+# а продавцу и админу — уведомление о заявке.
+
+def db_get_ad_any(channel_msg_id):
+    """Объявление по id поста в канале — включая проданные (для показа статуса)."""
+    try:
+        conn = db_connect(); cur = conn.cursor()
+        cur.execute("SELECT * FROM published WHERE channel_msg_id = %s", (channel_msg_id,))
+        row = cur.fetchone(); cur.close(); conn.close()
+        return row
+    except Exception as e:
+        logger.error(f"get_ad_any err: {e}")
+        return None
+
+
+async def show_buy_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE, ad_id):
+    """Показывает покупателю карточку букета и кнопку 'Хочу купить букет'."""
+    ad = db_get_ad_any(ad_id)
+    if not ad:
+        await update.message.reply_text(
+            "Объявление не найдено. Возможно, оно уже снято с публикации.")
+        return
+    if ad.get("sold"):
+        await update.message.reply_text(
+            "🥀 Этот букет уже продан.\n\n"
+            "Загляните в канал — там есть другие свежие букеты. "
+            "Или воспользуйтесь поиском: /search")
+        return
+
+    price = ad.get("price") or ""
+    try:
+        price = f"{int(''.join(c for c in price if c.isdigit())):,}".replace(",", " ")
+    except Exception:
+        pass
+    title = ad.get("title") or "Букет"
+    text = (
+        f"*{title}*\n"
+        "─────────────\n"
+        f"*Цена:*  {price} ₸\n"
+        f"*Город:*  {ad.get('city','—')}\n"
+        + (f"*Размер:*  {ad.get('size','—')}\n" if ad.get("size") else "")
+        + (f"*Свежесть:*  {ad.get('fresh','—')}\n" if ad.get("fresh") else "")
+        + "─────────────\n"
+        "Если вы *точно заинтересованы* в покупке этого букета — "
+        "нажмите кнопку ниже 👇\n\n"
+        "⚠️ *Безопасность:* чтобы не попасться на мошенников, "
+        "найдите третье лицо (например, водителя доставки) для проверки букета, "
+        "прежде чем переводить деньги."
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🌸 Хочу купить букет", callback_data=f"buy:{ad_id}")
+    ]])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def on_buy_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Покупатель подтвердил покупку → выдаём контакт продавца + уведомляем продавца и админа."""
+    q = update.callback_query
+    await q.answer()
+    try:
+        ad_id = int(q.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await q.answer("Ошибка заявки.", show_alert=True)
+        return
+
+    ad = db_get_ad_any(ad_id)
+    if not ad:
+        await q.edit_message_text("Объявление не найдено или снято с публикации.")
+        return
+    if ad.get("sold"):
+        await q.edit_message_text(
+            "🥀 Этот букет уже продан. Посмотрите другие — /search")
+        return
+
+    buyer = q.from_user
+    title = ad.get("title") or "Букет"
+
+    # 1) покупателю — контакт продавца
+    contact_lines = ["✅ *Контакты продавца:*", "─────────────"]
+    phone = ad.get("phone") or ""
+    phone_digits = "".join(c for c in phone if c.isdigit())
+    if phone:
+        contact_lines.append(f"*Телефон:*  {phone}")
+    links = []
+    if phone_digits:
+        links.append(f"[WhatsApp](https://wa.me/{phone_digits})")
+    if ad.get("username"):
+        links.append(f"[Telegram](https://t.me/{ad['username']})")
+    if links:
+        contact_lines.append("*Написать:*  " + "  ·  ".join(links))
+    contact_lines.append("─────────────")
+    contact_lines.append(
+        "⚠️ Перед оплатой проверьте букет через третье лицо (водителя доставки). "
+        "Не переводите предоплату незнакомым людям.")
+    try:
+        await q.edit_message_text("\n".join(contact_lines), parse_mode="Markdown")
+    except Exception:
+        await q.message.reply_text("\n".join(contact_lines), parse_mode="Markdown")
+
+    # 2) продавцу — уведомление о заявке с контактом покупателя
+    buyer_uname = f"@{buyer.username}" if buyer.username else "(без username)"
+    seller_id = ad.get("seller_id")
+    if seller_id:
+        try:
+            await ctx.bot.send_message(
+                seller_id,
+                f"🔔 *Новая заявка на ваш букет!*\n"
+                f"«{title}»\n"
+                "─────────────\n"
+                f"Покупатель: {buyer.first_name or 'Покупатель'} {buyer_uname}\n"
+                f"ID: `{buyer.id}`\n"
+                "─────────────\n"
+                "Покупатель получил ваши контакты и может написать вам. "
+                "Можете связаться первым, если хотите.",
+                parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"notify seller err: {e}")
+
+    # 3) админу — для статистики/контроля
+    if ADMIN_ID:
+        try:
+            await ctx.bot.send_message(
+                ADMIN_ID,
+                f"💰 *Заявка на покупку*\n"
+                f"Букет: «{title}» (#{ad_id})\n"
+                f"Покупатель: {buyer.first_name or '—'} {buyer_uname} (ID `{buyer.id}`)\n"
+                f"Продавец ID: `{seller_id}`",
+                parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"notify admin buy err: {e}")
+
+
+# ════════════════════════════════════════════════════════════
 #                    ПОИСК ПО ОБЪЯВЛЕНИЯМ
 # ════════════════════════════════════════════════════════════
 # Покупатель жмёт «Найти букет» или /search → выбирает город → размер
@@ -564,7 +710,7 @@ async def search_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Попробуйте другой размер или загляните позже.")
         return
 
-    # для каждого объявления — короткая карточка + кнопка «Открыть в канале»
+    # для каждого объявления — короткая карточка + кнопка «Заявка на покупку»
     for a in ads:
         price = a.get("price") or ""
         try:
@@ -576,15 +722,12 @@ async def search_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"Цена: {price} ₸\n"
                 f"Город: {a.get('city','—')}\n"
                 f"Размер: {a.get('size','—')}\n"
-                f"Свежесть: {a.get('fresh','—')}\n"
-                f"Связь: {a.get('phone','—')}")
-        btns = []
-        phone_digits = "".join(c for c in (a.get("phone") or "") if c.isdigit())
-        if phone_digits:
-            btns.append(InlineKeyboardButton("WhatsApp", url=f"https://wa.me/{phone_digits}"))
-        if a.get("username"):
-            btns.append(InlineKeyboardButton("Telegram", url=f"https://t.me/{a['username']}"))
-        kb = InlineKeyboardMarkup([btns]) if btns else None
+                f"Свежесть: {a.get('fresh','—')}")
+        # контакты скрыты — связь только через заявку
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🌸 Хочу купить букет",
+                                 callback_data=f"buy:{a['channel_msg_id']}")
+        ]])
         await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
     if len(ads) >= 10:
@@ -1042,20 +1185,21 @@ def format_ad(d):
     if d.get("fresh"):
         txt += f"*Свежесть:*  {d['fresh']}\n"
     txt += "─────────────\n"
-    txt += f"*Связь:*  {d['phone']}"
-    # контакты ссылками (вместо кнопок — чтобы влезли в подпись альбома)
-    contacts = []
-    phone_digits = "".join(c for c in d["phone"] if c.isdigit())
-    if phone_digits:
-        contacts.append(f"[WhatsApp](https://wa.me/{phone_digits})")
-    if d.get("seller_username"):
-        contacts.append(f"[Telegram](https://t.me/{d['seller_username']})")
-    if contacts:
-        txt += "\n*Написать:*  " + "  ·  ".join(contacts)
-    # ссылка на поддержку под каждым постом канала (deep-link открывает чат с ботом)
-    if BOT_USERNAME:
-        txt += f"\n\n_Вопрос администратору:_ [написать в поддержку](https://t.me/{BOT_USERNAME}?start=support)"
+    # Контакты НЕ показываем открыто — связь только через кнопку «Заявка на покупку».
+    txt += ("Этот букет продаётся по *фиксированной цене*.\n"
+            "Для связи с продавцом нажмите кнопку ниже 👇")
     return txt
+
+
+def channel_buy_button(channel_msg_id):
+    """Кнопка 'Заявка на покупку' под постом канала — ведёт на бота через deep-link."""
+    if not BOT_USERNAME:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✉️ Заявка на покупку",
+            url=f"https://t.me/{BOT_USERNAME}?start=buy_{channel_msg_id}")
+    ]])
 
 
 async def _submit_to_moderation(chat_id, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1201,6 +1345,14 @@ async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 price=d.get("price", ""),
                 phone=d.get("phone", ""),
                 username=d.get("seller_username", ""))
+            # кнопка «Заявка на покупку» — отдельным сообщением под постом
+            # (к альбому кнопку прикрепить нельзя; deep-link открывает бота)
+            buy_kb = channel_buy_button(sent.message_id)
+            if buy_kb:
+                await ctx.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text="👇 Для покупки этого букета нажмите кнопку",
+                    reply_markup=buy_kb)
             await _edit_mod_status(q, "\n\n*ОПУБЛИКОВАНО*")
             try:
                 await ctx.bot.send_message(
@@ -1598,6 +1750,8 @@ def main():
     app.add_handler(CallbackQueryHandler(search_start, pattern="^search_start$"))
     app.add_handler(CallbackQueryHandler(search_city, pattern="^sc:"))
     app.add_handler(CallbackQueryHandler(search_results, pattern="^ss:"))
+    # заявка на покупку
+    app.add_handler(CallbackQueryHandler(on_buy_confirm, pattern="^buy:"))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(send_to_moderation, pattern="^send_mod$"))
     app.add_handler(CallbackQueryHandler(on_moderation, pattern="^(approve|reject)$"))
