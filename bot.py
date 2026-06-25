@@ -166,6 +166,13 @@ def db_init():
         """)
         # на случай, если таблица уже была создана без колонки title — добавим
         cur.execute("ALTER TABLE published ADD COLUMN IF NOT EXISTS title TEXT DEFAULT ''")
+        # колонки для поиска/фильтров (добавляются, если их ещё нет)
+        cur.execute("ALTER TABLE published ADD COLUMN IF NOT EXISTS city TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE published ADD COLUMN IF NOT EXISTS size TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE published ADD COLUMN IF NOT EXISTS fresh TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE published ADD COLUMN IF NOT EXISTS price TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE published ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE published ADD COLUMN IF NOT EXISTS username TEXT DEFAULT ''")
         conn.commit()
         cur.close()
         conn.close()
@@ -202,16 +209,58 @@ def db_del_pending(admin_msg_id):
     except Exception as e:
         logger.error(f"del_pending err: {e}")
 
-def db_save_published(channel_msg_id, seller_id, chat_id, is_caption, title=""):
+def db_save_published(channel_msg_id, seller_id, chat_id, is_caption, title="",
+                      city="", size="", fresh="", price="", phone="", username=""):
     try:
         conn = db_connect(); cur = conn.cursor()
         cur.execute(
-            "INSERT INTO published (channel_msg_id, seller_id, chat_id, is_caption, title) "
-            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (channel_msg_id) DO NOTHING",
-            (channel_msg_id, seller_id, chat_id, is_caption, title))
+            "INSERT INTO published "
+            "(channel_msg_id, seller_id, chat_id, is_caption, title, city, size, fresh, price, phone, username) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (channel_msg_id) DO NOTHING",
+            (channel_msg_id, seller_id, chat_id, is_caption, title,
+             city, size, fresh, price, phone, username))
         conn.commit(); cur.close(); conn.close()
     except Exception as e:
         logger.error(f"save_published err: {e}")
+
+
+def db_search_ads(city=None, size=None, limit=10):
+    """Поиск активных (непроданных) объявлений по фильтрам."""
+    try:
+        conn = db_connect(); cur = conn.cursor()
+        sql = "SELECT * FROM published WHERE sold = FALSE"
+        params = []
+        if city:
+            # совпадение по началу города (чтобы 'Алматы' находило 'Алматы, ... район')
+            sql += " AND city ILIKE %s"
+            params.append(city + "%")
+        if size:
+            sql += " AND size = %s"
+            params.append(size)
+        sql += " ORDER BY created DESC LIMIT %s"
+        params.append(limit)
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall(); cur.close(); conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"search_ads err: {e}")
+        return []
+
+
+def db_search_cities():
+    """Список городов, по которым есть активные объявления (для меню поиска)."""
+    try:
+        conn = db_connect(); cur = conn.cursor()
+        # берём первую часть города (до запятой), чтобы 'Алматы, ... район' схлопнулось в 'Алматы'
+        cur.execute(
+            "SELECT DISTINCT split_part(city, ',', 1) AS c FROM published "
+            "WHERE sold = FALSE AND city <> '' ORDER BY c")
+        rows = cur.fetchall(); cur.close(); conn.close()
+        return [r["c"] for r in rows if r.get("c")]
+    except Exception as e:
+        logger.error(f"search_cities err: {e}")
+        return []
 
 def db_get_published(channel_msg_id):
     try:
@@ -261,6 +310,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "друг"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("Подать объявление", callback_data="new_ad")],
+        [InlineKeyboardButton("🔎 Найти букет", callback_data="search_start")],
         [InlineKeyboardButton("Как это работает", callback_data="how")],
         [InlineKeyboardButton("✉️ Связаться с поддержкой", callback_data="support_start")],
     ])
@@ -288,7 +338,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "─────────────\n"
         "Когда букет продан — отправьте команду /sold в этом чате с ботом, "
         "и отметьте его как проданный.\n\n"
-        "/start — начать\n/support — связаться с поддержкой\n/cancel — отменить",
+        "/start — начать\n/search — найти букет\n/support — связаться с поддержкой\n/cancel — отменить",
         parse_mode="Markdown")
 
 
@@ -418,6 +468,127 @@ async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Ответ отправлен.")
     except Exception as e:
         await update.message.reply_text(f"Не удалось отправить: {e}")
+
+
+# ════════════════════════════════════════════════════════════
+#                    ПОИСК ПО ОБЪЯВЛЕНИЯМ
+# ════════════════════════════════════════════════════════════
+# Покупатель жмёт «Найти букет» или /search → выбирает город → размер
+# (или «любой») → бот показывает подходящие активные объявления.
+# Состояние не хранится в ConversationHandler — всё в callback_data,
+# чтобы поиск не конфликтовал с анкетой подачи объявления.
+
+# короткий код размера для callback_data (callback ограничен 64 байтами)
+SIZE_CODES = {
+    "any":  "Любой",
+    "huge": "Огромный",
+    "big":  "Большой",
+    "mid":  "Средний",
+    "sml":  "Маленький",
+    "vol":  "Объёмный",
+}
+SIZE_BY_NAME = {v: k for k, v in SIZE_CODES.items()}
+
+
+async def cmd_search(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Команда /search — старт поиска: показать список городов."""
+    await _search_show_cities(update.message.reply_text)
+
+
+async def search_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Кнопка 'Найти букет' из меню /start."""
+    q = update.callback_query
+    await q.answer()
+    await _search_show_cities(q.message.reply_text)
+
+
+async def _search_show_cities(reply_func):
+    cities = db_search_cities()
+    if not cities:
+        await reply_func(
+            "Пока нет активных объявлений для поиска.\n"
+            "Загляните позже — продавцы постоянно добавляют букеты.")
+        return
+    rows = []
+    for i in range(0, len(cities), 2):
+        row = [InlineKeyboardButton(cities[i], callback_data=f"sc:{cities[i][:30]}")]
+        if i + 1 < len(cities):
+            row.append(InlineKeyboardButton(cities[i + 1], callback_data=f"sc:{cities[i+1][:30]}"))
+        rows.append(row)
+    await reply_func(
+        "*Поиск букета*\n─────────────\nВыберите город:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def search_city(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выбран город → предлагаем выбрать размер."""
+    q = update.callback_query
+    await q.answer()
+    city = q.data.split(":", 1)[1]
+    rows = []
+    items = list(SIZE_CODES.items())
+    for i in range(0, len(items), 2):
+        row = [InlineKeyboardButton(items[i][1], callback_data=f"ss:{city}:{items[i][0]}")]
+        if i + 1 < len(items):
+            row.append(InlineKeyboardButton(items[i+1][1], callback_data=f"ss:{city}:{items[i+1][0]}"))
+        rows.append(row)
+    try:
+        await q.edit_message_text(
+            f"*Поиск букета*\n─────────────\nГород: *{city}*\nВыберите размер:",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+    except Exception:
+        await q.message.reply_text(
+            f"*Поиск букета*\n─────────────\nГород: *{city}*\nВыберите размер:",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def search_results(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Выбран размер → показываем результаты поиска."""
+    q = update.callback_query
+    await q.answer()
+    _, city, size_code = q.data.split(":", 2)
+    size_name = SIZE_CODES.get(size_code, "Любой")
+    size_filter = None if size_code == "any" else size_name
+
+    ads = db_search_ads(city=city, size=size_filter, limit=10)
+    head = f"🔎 *Результаты поиска*\nГород: {city}  ·  Размер: {size_name}\n─────────────"
+    try:
+        await q.edit_message_text(head, parse_mode="Markdown")
+    except Exception:
+        await q.message.reply_text(head, parse_mode="Markdown")
+
+    if not ads:
+        await q.message.reply_text(
+            "По вашему запросу пока ничего нет.\n"
+            "Попробуйте другой размер или загляните позже.")
+        return
+
+    # для каждого объявления — короткая карточка + кнопка «Открыть в канале»
+    for a in ads:
+        price = a.get("price") or ""
+        try:
+            price = f"{int(''.join(c for c in price if c.isdigit())):,}".replace(",", " ")
+        except Exception:
+            pass
+        title = a.get("title") or "Букет"
+        text = (f"*{title}*\n"
+                f"Цена: {price} ₸\n"
+                f"Город: {a.get('city','—')}\n"
+                f"Размер: {a.get('size','—')}\n"
+                f"Свежесть: {a.get('fresh','—')}\n"
+                f"Связь: {a.get('phone','—')}")
+        btns = []
+        phone_digits = "".join(c for c in (a.get("phone") or "") if c.isdigit())
+        if phone_digits:
+            btns.append(InlineKeyboardButton("WhatsApp", url=f"https://wa.me/{phone_digits}"))
+        if a.get("username"):
+            btns.append(InlineKeyboardButton("Telegram", url=f"https://t.me/{a['username']}"))
+        kb = InlineKeyboardMarkup([btns]) if btns else None
+        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+    if len(ads) >= 10:
+        await q.message.reply_text("Показаны первые 10. Уточните фильтры, чтобы увидеть нужное.")
 
 
 # ════════════════════════════════════════════════════════════
@@ -1020,9 +1191,16 @@ async def on_moderation(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                         chat_id=CHANNEL_ID, photo=first["id"], caption=caption,
                         parse_mode="Markdown")
             is_caption = True
-            # сохраняем опубликованное в БАЗУ (с названием, чтобы показать в /sold)
-            db_save_published(sent.message_id, d["seller_id"], sent.chat_id, is_caption,
-                              d.get("title", ""))
+            # сохраняем опубликованное в БАЗУ (с полями для поиска)
+            db_save_published(
+                sent.message_id, d["seller_id"], sent.chat_id, is_caption,
+                title=d.get("title", ""),
+                city=d.get("city", ""),
+                size=d.get("size", ""),
+                fresh=d.get("fresh", ""),
+                price=d.get("price", ""),
+                phone=d.get("phone", ""),
+                username=d.get("seller_username", ""))
             await _edit_mod_status(q, "\n\n*ОПУБЛИКОВАНО*")
             try:
                 await ctx.bot.send_message(
@@ -1415,6 +1593,11 @@ def main():
     app.add_handler(CommandHandler("reply", cmd_reply))
     app.add_handler(CallbackQueryHandler(support_start, pattern="^support_start$"))
     app.add_handler(CallbackQueryHandler(support_cancel, pattern="^support_cancel$"))
+    # поиск по объявлениям
+    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CallbackQueryHandler(search_start, pattern="^search_start$"))
+    app.add_handler(CallbackQueryHandler(search_city, pattern="^sc:"))
+    app.add_handler(CallbackQueryHandler(search_results, pattern="^ss:"))
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(send_to_moderation, pattern="^send_mod$"))
     app.add_handler(CallbackQueryHandler(on_moderation, pattern="^(approve|reject)$"))
